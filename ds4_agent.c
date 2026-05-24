@@ -288,6 +288,8 @@ static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
 
 static void worker_apply_pending_power(agent_worker *w);
+static void agent_trace(agent_worker *w, const char *fmt, ...);
+static void agent_publish_system_status(agent_worker *w, const char *msg);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -669,6 +671,7 @@ static const char agent_tools_prompt_intro[] =
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
+    "For edit, always put the edited file path as the first parameter. "
     "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
     "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
     "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
@@ -932,6 +935,9 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     }
 
     char *reminder = agent_build_system_prompt_reminder();
+    agent_publish_system_status(w, "Re-injecting system prompt reminder...");
+    agent_trace(w, "system prompt reminder injected at transcript=%d",
+                w->transcript.len);
     ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     free(reminder);
 
