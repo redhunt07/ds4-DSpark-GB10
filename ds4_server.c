@@ -8764,6 +8764,14 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
     ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
+static void kv_cache_evict_failed_disk_entry(server *s, const char *path) {
+    if (!path) return;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: kv cache evicted reason=prefill-failed file=%s", path);
+    unlink(path);
+    ds4_session_invalidate(s->session);
+}
+
 static void kv_cache_maybe_store_continued(server *s) {
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
@@ -10030,7 +10038,6 @@ static void generate_job(server *s, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
-    free(disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -10132,6 +10139,8 @@ static void generate_job(server *s, job *j) {
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
+            kv_cache_evict_failed_disk_entry(s, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -10153,10 +10162,13 @@ static void generate_job(server *s, job *j) {
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
+        kv_cache_evict_failed_disk_entry(s, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
