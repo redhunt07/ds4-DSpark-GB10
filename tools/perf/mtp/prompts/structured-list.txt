@@ -1,0 +1,1 @@
+List 100 fictional harbor towns, one per line. Each name should sound plausible (combine real place-name patterns: Norse, Cornish, Welsh, New England, Mediterranean coastal). Output ONLY the names, one per line, numbered 1 to 100. Do not add any introduction, explanation, or trailing remark.

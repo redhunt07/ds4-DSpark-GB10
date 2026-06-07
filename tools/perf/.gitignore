@@ -1,0 +1,9 @@
+__pycache__/
+runs/*.nsys-rep
+runs/*.sqlite
+
+# bench-with-monitor.sh per-run output dirs — keep only the reference dirs the
+# README links to; new runs land beside them but stay out of the commit history.
+runs/*/
+!runs/thermal-matrix/
+!runs/thermal-repro/

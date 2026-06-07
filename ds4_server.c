@@ -377,6 +377,44 @@ static bool json_skip_value(const char **p) {
     return json_skip_value_depth(p, 0);
 }
 
+/* Parse a {"name":"profile","attn":F,"ffn":F} object (all keys optional, unknown
+ * keys skipped).  Sets *attn_set / *ffn_set for axes present and replaces *name
+ * (heap, caller owns) when a name/profile key is given.  Malformed JSON -> false. */
+static bool json_parse_steering_obj(const char **p, float *attn, bool *attn_set,
+                                    float *ffn, bool *ffn_set, char **name) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *k = NULL;
+        if (!json_string(p, &k)) return false;
+        json_ws(p);
+        if (**p != ':') { free(k); return false; }
+        (*p)++;
+        bool okk = true;
+        if (!strcmp(k, "attn")) {
+            double v = 0.0; okk = json_number(p, &v);
+            if (okk) { *attn = (float)v; *attn_set = true; }
+        } else if (!strcmp(k, "ffn")) {
+            double v = 0.0; okk = json_number(p, &v);
+            if (okk) { *ffn = (float)v; *ffn_set = true; }
+        } else if (name && (!strcmp(k, "name") || !strcmp(k, "profile"))) {
+            char *v = NULL; okk = json_string(p, &v);
+            if (okk) { free(*name); *name = v; }
+        } else {
+            okk = json_skip_value(p);
+        }
+        free(k);
+        if (!okk) return false;
+        json_ws(p);
+        if (**p == ',') { (*p)++; json_ws(p); }
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 static bool json_raw_value(const char **p, char **out) {
     json_ws(p);
     const char *start = *p;
@@ -488,6 +526,7 @@ fail:
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
+    REQ_STEERING_CONTROL,   /* admin: get/set directional steering (no generation) */
 } req_kind;
 
 typedef enum {
@@ -644,6 +683,18 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* Directional steering.  For REQ_CHAT: per-request scale override (the
+     * *_set flags select which axis the request overrides; omitted axes keep
+     * the server default).  For REQ_STEERING_CONTROL: the admin payload
+     * (steering_name = profile file under --steering-dir, NULL keeps current
+     * vectors; steering_is_get = read-only). */
+    float steering_attn;
+    float steering_ffn;
+    bool steering_attn_set;
+    bool steering_ffn_set;
+    char *steering_name;
+    bool steering_is_get;
+    bool steering_is_list;   /* GET /v1/steering/profiles */
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -784,6 +835,7 @@ static void request_free(request *r) {
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
+    free(r->steering_name);
     memset(r, 0, sizeof(*r));
 }
 
@@ -2704,6 +2756,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->temperature = (float)v;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2915,6 +2974,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->temperature = (float)v;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3817,6 +3883,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->temperature = (float)v;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4035,6 +4108,13 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->temperature = (float)v;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -7733,6 +7813,15 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Directional steering runtime state.  default_steering_{attn,ffn} are the
+     * baseline scales applied to every job (set at launch from --dir-steering-*,
+     * updated by POST /v1/steering); a per-request `steering` field overrides
+     * them for that one request.  steering_dir gates admin profile loads to a
+     * trusted directory (a request names a file within it). */
+    const char *steering_dir;
+    float default_steering_attn;
+    float default_steering_ffn;
+    char *steering_current_name;   /* last loaded profile name, for GET reporting */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -9988,9 +10077,74 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+static char *steering_resolve_profile(server *s, const char *name, char *err, size_t errlen);
+
+/* Steering strength tiers exposed in model ids: "<base>:<profile>[:<tier>]".
+ * No tier = default. send_models advertises them; generate_job parses the
+ * suffix into per-request steering. */
+static const struct { const char *suffix; float ffn; } k_steer_tiers[] = {
+    { "",        2.0f },   /* deepseek-v4-flash:<profile>         (validated default) */
+    { ":subtle", 1.0f },   /* deepseek-v4-flash:<profile>:subtle  */
+    { ":strong", 3.0f },   /* deepseek-v4-flash:<profile>:strong  */
+};
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
+    /* Model-name steering (client model dropdown): a model id of the form
+     * "<base>:<profile>[:<tier>]" selects a steering profile + strength tier
+     * (see send_models / k_steer_tiers).  Translate it into the per-request
+     * steering fields below, unless the request already set steering explicitly.
+     * The model id is left intact (echoed back to match the client's request). */
+    if (!j->req.steering_name && !j->req.steering_ffn_set && !j->req.steering_attn_set &&
+        j->req.model) {
+        const char *colon = strchr(j->req.model, ':');
+        if (colon && colon[1]) {
+            const char *spec = colon + 1;                 /* profile[:tier] */
+            const char *tier = strchr(spec, ':');
+            const size_t plen = tier ? (size_t)(tier - spec) : strlen(spec);
+            if (plen > 0 && plen < 128) {
+                char prof[128];
+                memcpy(prof, spec, plen);
+                prof[plen] = '\0';
+                float ffn = 2.0f;                         /* default tier (k_steer_tiers[0]) */
+                if (tier) {
+                    for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++)
+                        if (k_steer_tiers[t].suffix[0] && !strcmp(tier, k_steer_tiers[t].suffix)) {
+                            ffn = k_steer_tiers[t].ffn;
+                            break;
+                        }
+                }
+                j->req.steering_name = xstrdup(prof);
+                j->req.steering_ffn = ffn;
+                j->req.steering_ffn_set = true;
+            }
+        }
+    }
+    /* Resolve this job's effective steering profile + scale before any forward
+     * (prefill + decode).  Set every job (serial worker) so it resets to the
+     * server default unless this request overrides — no save/restore needed.
+     * A per-request profile name is loaded (cached) from --steering-dir; the
+     * default profile is already cached so re-selecting it is a pointer swap. */
+    {
+        const float a = j->req.steering_attn_set ? j->req.steering_attn : s->default_steering_attn;
+        const float f = j->req.steering_ffn_set  ? j->req.steering_ffn  : s->default_steering_ffn;
+        char serr[200];
+        if (j->req.steering_name && j->req.steering_name[0]) {
+            char *path = steering_resolve_profile(s, j->req.steering_name, serr, sizeof(serr));
+            int rc = path ? ds4_session_steering_select(s->session, j->req.steering_name,
+                                                        path, a, f, serr, sizeof(serr)) : 1;
+            free(path);
+            if (rc != 0) { http_error(j->fd, s->enable_cors, 400, serr); return; }
+        } else if (s->steering_current_name && s->steering_current_name[0]) {
+            /* Default profile is already cached -> NULL path resolves via cache. */
+            if (ds4_session_steering_select(s->session, s->steering_current_name,
+                                            NULL, a, f, serr, sizeof(serr)) != 0)
+                ds4_session_set_steering_scale(s->session, a, f);
+        } else {
+            ds4_session_set_steering_scale(s->session, a, f);
+        }
+    }
     const int old_pos = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -10423,6 +10577,23 @@ decode_again:
                                                        token,
                                                        max_tokens - completion,
                                                        ds4_token_eos(s->engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
+        } else if (temperature > 0.0f &&
+                   ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+        {
+            ntok = ds4_session_eval_speculative_sample(s->session,
+                                                       token,
+                                                       max_tokens - completion,
+                                                       ds4_token_eos(s->engine),
+                                                       temperature, top_k, top_p, min_p, &rng,
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -11064,12 +11235,148 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Parse the POST /v1/steering admin body: {"name":"profile","attn":F,"ffn":F}
+ * (all optional; name also accepts "profile"/"file").  GET carries no body. */
+static bool parse_steering_request(const char *body, bool is_get, bool is_list,
+                                   request *r, char *err, size_t errlen) {
+    request_init(r, REQ_STEERING_CONTROL, 0);
+    r->steering_is_get = is_get;
+    r->steering_is_list = is_list;
+    if (is_get) return true;
+    const char *p = body ? body : "";
+    json_ws(&p);
+    if (*p != '{') { snprintf(err, errlen, "expected a JSON object"); return false; }
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) { snprintf(err, errlen, "malformed JSON"); return false; }
+        json_ws(&p);
+        if (*p != ':') { free(key); snprintf(err, errlen, "malformed JSON"); return false; }
+        p++;
+        bool okk = true;
+        if (!strcmp(key, "name") || !strcmp(key, "profile") || !strcmp(key, "file")) {
+            char *v = NULL; okk = json_string(&p, &v);
+            if (okk) { free(r->steering_name); r->steering_name = v; }
+        } else if (!strcmp(key, "attn")) {
+            double v = 0.0; okk = json_number(&p, &v);
+            if (okk) { r->steering_attn = (float)v; r->steering_attn_set = true; }
+        } else if (!strcmp(key, "ffn")) {
+            double v = 0.0; okk = json_number(&p, &v);
+            if (okk) { r->steering_ffn = (float)v; r->steering_ffn_set = true; }
+        } else {
+            okk = json_skip_value(&p);
+        }
+        free(key);
+        if (!okk) { snprintf(err, errlen, "malformed JSON value"); return false; }
+        json_ws(&p);
+        if (*p == ',') { p++; json_ws(&p); }
+    }
+    return true;
+}
+
+/* Resolve a profile name to a path under steering_dir, rejecting '/' and ".." so
+ * a request can't load arbitrary server-side files. */
+static char *steering_resolve_profile(server *s, const char *name, char *err, size_t errlen) {
+    if (!s->steering_dir || !s->steering_dir[0]) {
+        snprintf(err, errlen, "server started without --steering-dir; profile loading is disabled");
+        return NULL;
+    }
+    if (!name || !name[0] || strchr(name, '/') || strstr(name, "..")) {
+        snprintf(err, errlen, "invalid profile name (must be a bare filename under the steering dir)");
+        return NULL;
+    }
+    size_t need = strlen(s->steering_dir) + 1 + strlen(name) + 1;
+    char *path = xmalloc(need);
+    snprintf(path, need, "%s/%s", s->steering_dir, name);
+    return path;
+}
+
+/* Worker-side handler for REQ_STEERING_CONTROL: mutate the session's steering
+ * (serialized w.r.t. generation) and write the current state as JSON. */
+static void handle_steering_control(server *s, job *j) {
+    request *r = &j->req;
+    char err[200]; err[0] = '\0';
+    if (r->steering_is_list) {
+        /* List profiles available in --steering-dir, flagging cached + default.
+         * Runs in the worker so the cache read is serialized w.r.t. decode. */
+        buf b = {0};
+        buf_puts(&b, "{\"steering_dir\":");
+        if (s->steering_dir) json_escape(&b, s->steering_dir); else buf_puts(&b, "null");
+        buf_puts(&b, ",\"default\":");
+        if (s->steering_current_name) json_escape(&b, s->steering_current_name);
+        else buf_puts(&b, "null");
+        buf_puts(&b, ",\"profiles\":[");
+        int n = 0;
+        DIR *d = s->steering_dir ? opendir(s->steering_dir) : NULL;
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;            /* skip ., .., hidden */
+                if (strchr(de->d_name, '/')) continue;
+                if (n++) buf_putc(&b, ',');
+                buf_puts(&b, "{\"name\":");
+                json_escape(&b, de->d_name);
+                buf_printf(&b, ",\"cached\":%s,\"default\":%s}",
+                           ds4_session_steering_is_cached(s->session, de->d_name) ? "true" : "false",
+                           (s->steering_current_name && !strcmp(s->steering_current_name, de->d_name))
+                               ? "true" : "false");
+            }
+            closedir(d);
+        }
+        buf_puts(&b, "]}\n");
+        http_response(j->fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        return;
+    }
+    if (!r->steering_is_get) {
+        const float new_attn = r->steering_attn_set ? r->steering_attn : s->default_steering_attn;
+        const float new_ffn  = r->steering_ffn_set ? r->steering_ffn : s->default_steering_ffn;
+        int rc;
+        if (r->steering_name && r->steering_name[0]) {
+            char *path = steering_resolve_profile(s, r->steering_name, err, sizeof(err));
+            if (!path) { http_error(j->fd, s->enable_cors, 400, err); return; }
+            rc = ds4_session_steering_select(s->session, r->steering_name, path,
+                                             new_attn, new_ffn, err, sizeof(err));
+            free(path);
+            if (rc == 0) {
+                free(s->steering_current_name);
+                s->steering_current_name = xstrdup(r->steering_name);
+            }
+        } else {
+            rc = ds4_session_set_steering_scale(s->session, new_attn, new_ffn);
+            if (rc != 0) snprintf(err, sizeof(err), "steering is only available on the GPU backend");
+        }
+        if (rc != 0) { http_error(j->fd, s->enable_cors, 500, err); return; }
+        s->default_steering_attn = new_attn;
+        s->default_steering_ffn = new_ffn;
+    }
+    /* Report the server's persistent default (a per-request profile/scale is
+     * transient and may leave the live graph mismatched between jobs). */
+    const float attn = s->default_steering_attn;
+    const float ffn = s->default_steering_ffn;
+    const bool loaded = s->steering_current_name != NULL;
+    buf b = {0};
+    buf_printf(&b, "{\"attn\":%g,\"ffn\":%g,\"loaded\":%s,\"enabled\":%s,\"profile\":",
+               (double)attn, (double)ffn, loaded ? "true" : "false",
+               (loaded && (attn != 0.0f || ffn != 0.0f)) ? "true" : "false");
+    if (s->steering_current_name) json_escape(&b, s->steering_current_name);
+    else buf_puts(&b, "null");
+    buf_puts(&b, ",\"steering_dir\":");
+    if (s->steering_dir) json_escape(&b, s->steering_dir);
+    else buf_puts(&b, "null");
+    buf_puts(&b, "}\n");
+    http_response(j->fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, j);
+        if (j->req.kind == REQ_STEERING_CONTROL) handle_steering_control(s, j);
+        else generate_job(s, j);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11226,9 +11533,30 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
+    /* Advertise only the variant actually loaded (flash vs pro is detected from
+     * the GGUF; the other has no weights), plus its steered variants. */
+    const char *base = server_model_id_from_engine(s->engine);
+    append_model_json(&b, s, base);
+    /* Steered variants: one model id per (profile in --steering-dir) x tier, so a
+     * client's model dropdown becomes the persona+strength selector. */
+    if (s->steering_dir && s->steering_dir[0]) {
+        DIR *d = opendir(s->steering_dir);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;                 /* ., .., hidden */
+                if (strchr(de->d_name, '/') || strchr(de->d_name, ':')) continue;
+                for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++) {
+                    char id[256];
+                    snprintf(id, sizeof(id), "%s:%s%s",
+                             base, de->d_name, k_steer_tiers[t].suffix);
+                    buf_putc(&b, ',');
+                    append_model_json(&b, s, id);
+                }
+            }
+            closedir(d);
+        }
+    }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11294,6 +11622,12 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/steering")) {
+        ok = parse_steering_request(hr.body, false, false, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/steering/profiles")) {
+        ok = parse_steering_request(NULL, true, true, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/steering")) {
+        ok = parse_steering_request(NULL, true, false, &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);
@@ -11402,6 +11736,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *steering_dir;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11515,7 +11850,7 @@ static server_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_server_backend(),
-            .mtp_draft_tokens = 1,
+            .mtp_draft_tokens = 2,
             .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
@@ -11650,6 +11985,8 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--steering-dir")) {
+            c.steering_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -11740,6 +12077,16 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.steering_dir = cfg.steering_dir;
+    s.default_steering_attn = cfg.engine.directional_steering_attn;
+    s.default_steering_ffn = cfg.engine.directional_steering_ffn;
+    /* A launch --dir-steering-file is cached under its basename at session
+     * create; record that as the default profile so each job restores it (and
+     * a per-request profile reverts after). */
+    if (cfg.engine.directional_steering_file && cfg.engine.directional_steering_file[0]) {
+        const char *b = strrchr(cfg.engine.directional_steering_file, '/');
+        s.steering_current_name = xstrdup(b ? b + 1 : cfg.engine.directional_steering_file);
+    }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);

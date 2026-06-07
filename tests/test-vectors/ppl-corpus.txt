@@ -1,0 +1,87 @@
+The river kept its own counsel. Each morning the surveyor walked the eastern bank
+with a brass level and a notebook bound in oilcloth, marking the slow migration of
+the channel against the iron pins his predecessor had driven a generation earlier.
+The pins were rusted now, and two had vanished entirely beneath a gravel bar that
+had not existed the previous spring. He recorded what he could measure and left the
+rest to the patience of sediment, which answers every question eventually, though
+never on the schedule of the men who ask it.
+
+By noon the heat lay flat across the floodplain. Cattle stood in the shade of the
+cottonwoods without moving, and the only sound was the dry tick of grasshoppers in
+the fennel. The surveyor ate bread and a hard yellow cheese, drank from a canteen
+that tasted faintly of tin, and considered the problem of the meander. A river that
+bends will cut its outer bank and build its inner one, and so the bend grows sharper
+until the neck pinches shut and the water abandons the loop altogether, leaving a
+crescent lake to silt up and become, in time, a meadow. There was nothing to be done
+about it. You could armor the bank with stone, and the river would simply find the
+weakness you had not anticipated, because a river has more time than any engineer.
+
+In the afternoon he climbed the bluff to triangulate from the old benchmark. From
+the height the whole valley resolved into a single argument about gradient and load:
+where the slope steepened the water ran clear and fast over cobbles; where it slackened
+the channel braided and dropped its burden of silt; and at every transition the form
+of the bed encoded the history of every flood that had ever passed. He thought that a
+sufficiently patient reader could recover the climate of a century from the stratigraphy
+of a cutbank, the way an astronomer recovers the chemistry of a star from a smear of
+light. The thought pleased him, and he wrote it down, and then crossed it out, because
+it was the kind of thing that sounded better than it was true.
+
+He finished the traverse before the light failed and walked back along the levee. A
+heron lifted from the shallows ahead of him, unfolding with the deliberate economy of
+something that has never once in its life been in a hurry, and beat slowly downstream
+until the dusk took it. The pins would still be there in the morning, or some of them
+would, and the channel would have moved an imperceptible increment closer to the town,
+and the calculation would begin again. This was the whole of the work: to measure a
+thing that would not hold still, and to write the measurement down as though it would.
+
+Consider now a small program that performs the same kind of bookkeeping against a
+stream that does hold still, at least for the duration of a single pass. The function
+below accumulates a running summary of a sequence of floating-point samples, tracking
+the count, the mean, and the variance in a single traversal using Welford's method,
+which is numerically stable in a way that the naive sum-of-squares is not.
+
+def running_stats(samples):
+    n = 0
+    mean = 0.0
+    m2 = 0.0
+    for x in samples:
+        n += 1
+        delta = x - mean
+        mean += delta / n
+        delta2 = x - mean
+        m2 += delta * delta2
+    if n < 2:
+        return (n, mean, float("nan"))
+    variance = m2 / (n - 1)
+    return (n, mean, variance)
+
+def merge_stats(a, b):
+    na, mean_a, var_a = a
+    nb, mean_b, var_b = b
+    n = na + nb
+    if n == 0:
+        return (0, 0.0, float("nan"))
+    delta = mean_b - mean_a
+    mean = mean_a + delta * (nb / n)
+    m2a = var_a * (na - 1) if na > 1 else 0.0
+    m2b = var_b * (nb - 1) if nb > 1 else 0.0
+    m2 = m2a + m2b + delta * delta * (na * nb / n)
+    variance = m2 / (n - 1) if n > 1 else float("nan")
+    return (n, mean, variance)
+
+The merge function is the part worth dwelling on. It exists so that the same summary
+can be computed in parallel over disjoint partitions of the data and then combined
+exactly, without revisiting any sample. The correction term, delta squared times the
+product of the counts over their sum, accounts for the fact that the two partial means
+were each computed against their own local origin; when the partitions are joined those
+origins must be reconciled. Omit the term and the variance drifts in proportion to the
+separation of the partition means, which is precisely the situation a careless test
+will fail to exercise, because the obvious test feeds both halves the same distribution
+and the means coincide and the bug stays hidden.
+
+A regression suite, then, is an argument about which inputs are allowed to coincide. It
+is not enough to show that the code produces the right answer on the inputs the author
+imagined; it must produce the right answer on the inputs the author did not imagine,
+and the only way to approach that asymptote is to keep adding cases until the failures
+stop arriving. The river offers the same lesson on a longer clock. You armor the bank
+you can see failing, and the next flood finds the bank you could not.

@@ -189,6 +189,50 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
+/* Host-only exactness self-test for the speculative-sampling math (no model/GPU
+ * needed).  Returns failing-case count (0 = pass). */
+int ds4_spec_sampling_selftest(void);
+/* MTP combined-forward correctness gate (CUDA-only).  Runs one two-token verify
+ * step through both the fast batched verify and the exact N=1 decode verify over
+ * an identical (start, token0, token1), then RMS-compares the per-row logits.
+ * The session must be synced to a real prefix.  Returns failed-check count
+ * (0 = pass); optional out params report worst-row RMS, the pass threshold,
+ * whether both rows kept top1, and the nonfinite count. */
+int ds4_mtp_correctness_selftest(ds4_session *s,
+                                 double *out_rms,
+                                 double *out_threshold,
+                                 int *out_top1_match,
+                                 int *out_nonfinite);
+/* MTP combined-forward self-consistency probe (CUDA-only).  Runs the same fast
+ * batched n=2 verify twice on identical inputs and max-abs/RMS-diffs the logit
+ * rows, isolating run-to-run nondeterminism from the algorithmic batch-vs-N=1
+ * gap.  Returns failed-check count (0 = bit-stable); optional out params report
+ * max-abs diff, RMS, and whether both row argmaxes stayed stable. */
+int ds4_mtp_selfconsistency_selftest(ds4_session *s,
+                                     double *out_maxabs,
+                                     double *out_rms,
+                                     int *out_top_stable);
+/* CUDA per-layer tensor-equivalence gate (CUDA-only).  Teacher-forces a single-
+ * token decode forward layer by layer and RMS/max-abs-diffs each GPU layer's
+ * post-FFN state against the CPU reference, localizing sub-argmax drift to the
+ * first diverging layer.  Returns the number of layers exceeding tolerance
+ * (0 = pass); optional out params report worst RMS / max-abs, first failing
+ * layer (-1 if none), and the non-finite GPU element count. */
+int ds4_cuda_tensor_equivalence_selftest(ds4_session *s,
+                                         double rms_tol,
+                                         double max_abs_tol,
+                                         double *out_worst_rms,
+                                         double *out_worst_max_abs,
+                                         int *out_first_fail_layer,
+                                         int *out_nonfinite);
+/* FastMTP harvest: per-doc batch dump target. ds4_mtp_dump_begin(base) routes
+ * the prefill base-HC dump to <base> and tokens to <base>.tok (overriding the
+ * legacy DS4_MTP_HC_DUMP env); ds4_mtp_dump_end() closes it. Lets a harvester
+ * load the model once and loop docs with a fresh session per doc. */
+void ds4_mtp_dump_begin(const char *base);
+void ds4_mtp_dump_end(void);
+/* Suppress chatty per-session startup logs (e.g. for the per-doc harvest loop). */
+void ds4_set_quiet_logs(int q);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -222,6 +266,29 @@ void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
+
+/* Runtime directional-steering control (GPU backend).  Steering scale is read
+ * fresh every forward, so changes take effect on the next eval; scale 0 on both
+ * axes is bit-identical to no steering (the projection is skipped).
+ *  - set_steering_scale: change attn/ffn strength (direction vectors must already
+ *    be loaded — at launch via --dir-steering-file, or via reload_steering).
+ *  - get_steering: read current scales + whether vectors are loaded.
+ *  - reload_steering: (re)load direction vectors from `path` and set scales.  A
+ *    non-empty path force-loads the vectors even at scale 0 (so a profile can be
+ *    staged for later per-request activation); an empty/NULL path only sets the
+ *    scales.  Returns 0 on success, nonzero on load failure (err filled). */
+int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn);
+void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded);
+/* True if profile `name` is already resident in the session's steering cache. */
+bool ds4_session_steering_is_cached(ds4_session *s, const char *name);
+/* Select profile `name` as active (loading it from `path` into a per-graph cache
+ * on first use, so repeat selections are a pointer swap) and set the scales.  An
+ * empty/NULL name turns steering off.  On load failure the active profile is
+ * left unchanged.  reload_steering is a path-based wrapper (name = basename). */
+int ds4_session_steering_select(ds4_session *s, const char *name, const char *path,
+                                float attn, float ffn, char *err, size_t errlen);
+int ds4_session_reload_steering(ds4_session *s, const char *path,
+                                float attn, float ffn, char *err, size_t errlen);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
@@ -266,6 +333,24 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+/* Distribution-preserving speculative SAMPLING decode (MTP at temperature > 0): drafts
+ * are sampled from the MTP draft distribution and verified by rejection sampling, so the
+ * committed stream is distributed exactly as plain sampling from the (truncated) target.
+ * first_token is the caller's freshly-sampled token; rng/params must match the sampler
+ * the caller uses.  Returns committed token count (>=1), or -1 on error. */
+int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        float temperature, int top_k, float top_p, float min_p,
+                                        uint64_t *rng,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
+/* Spike instrumentation: teacher-force n_tokens KNOWN tokens through one
+ * combined batched verify forward (multi-stream batched-decode cost model;
+ * see ds4-bench --batch-cost).  Requires an MTP-loaded session (scratch
+ * buffers only — the draft head is not called).  Advances the session by
+ * n_tokens positions; logits = after the last token.  Width cap 5. */
+int ds4_session_eval_batch_replay(ds4_session *s, const int *tokens, int n_tokens,
+                                  char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_kvstore.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -26,6 +27,7 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *chat_prompt_path;
+    const char *kv_restore_path;
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
@@ -45,10 +47,19 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    const char *mtp_path;
+    int mtp_draft_tokens;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    float temperature;   /* >0 => sampled decode (spec-sampling when --mtp); 0 => greedy */
+    float top_p;
+    float min_p;
+    uint64_t seed;
+    bool batch_cost;     /* multi-stream batch cost curve instead of the gen loop */
+    int batch_cost_w;    /* restrict --batch-cost to one width (nsys attribution) */
+    int batch_check;     /* token-exactness gate: plain vs batch replay over N tokens */
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -175,6 +186,11 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .mtp_draft_tokens = 2,
+        .temperature = 0.0f,        /* greedy by default */
+        .top_p = 0.95f,
+        .min_p = 0.0f,
+        .seed = 1234,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -208,6 +224,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
             c.chat_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-restore")) {
+            c.kv_restore_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ctx-start")) {
@@ -224,6 +242,14 @@ static bench_config parse_options(int argc, char **argv) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--batch-cost")) {
+            c.batch_cost = true;
+        } else if (!strcmp(arg, "--batch-cost-w")) {
+            c.batch_cost = true;
+            c.batch_cost_w = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--batch-check")) {
+            c.batch_cost = true;   /* same dispatch + validation as --batch-cost */
+            c.batch_check = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
@@ -284,6 +310,18 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--temp")) {
+            c.temperature = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--top-p")) {
+            c.top_p = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.min_p = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--seed")) {
+            c.seed = (uint64_t)strtoull(need_arg(&i, argc, argv, arg), NULL, 10);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -291,7 +329,12 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    if (c.kv_restore_path) {
+        if (c.prompt_path || c.chat_prompt_path) {
+            fprintf(stderr, "ds4-bench: --kv-restore is mutually exclusive with --prompt-file/--chat-prompt-file\n");
+            exit(2);
+        }
+    } else if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
     }
@@ -306,6 +349,17 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.step_mul == 1.0 && c.step_incr <= 0) {
         fprintf(stderr, "ds4-bench: --step-incr must be positive when --step-mul is 1\n");
         exit(2);
+    }
+    if (c.batch_cost) {
+        if (!c.mtp_path) {
+            fprintf(stderr, "ds4-bench: --batch-cost needs --mtp (verify scratch buffers; "
+                            "the draft head is not called)\n");
+            exit(2);
+        }
+        /* The replay teacher-forces up to (warmup+rounds)*Σ(1..5) = 270 prompt
+         * tokens past each frontier; gen_tokens only sizes ctx_alloc here (the
+         * gen loop is bypassed), so raise it to cover the replay headroom. */
+        if (c.gen_tokens < 280) c.gen_tokens = 280;
     }
     if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
@@ -505,6 +559,218 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+/* Multi-stream batched-decode cost curve (--batch-cost).
+ *
+ * Plain decode on GB10 is membw-bound per STREAM: one decode step reads the
+ * full hot weight set whether it serves 1 row or 5.  This measures what one
+ * fused forward costs at width w = 1..5 rows (the per-row KV/position
+ * indirection of true multi-session batching is NOT included — rows here are
+ * consecutive teacher-forced positions of one stream, so the numbers are the
+ * OPTIMISTIC bound that decides go/no-go on building real multi-session
+ * batching).  Widths are interleaved round-robin so depth drift averages out
+ * across widths instead of biasing the wide rows deeper.
+ *
+ * CSV rows: ctx_tokens,width,steps,ms_mean,ms_std,agg_tps,agg_speedup_vs_w1 */
+/* Token-exactness gate for the batch replay (--batch-check N).
+ *
+ * Pass A teacher-forces N prompt tokens through the plain decode path
+ * (eval_token_raw_swa), recording the greedy argmax after every position.
+ * Pass B replays the SAME positions through the batched verify forward at
+ * widths 2..5 (row_tops give rows 0..w-2; the wrapper's last-row logits give
+ * row w-1) and compares argmaxes position-by-position.  Combined batch-N MoE /
+ * attention is documented as not bit-identical to N=1 raw_swa (near-tie
+ * drift), so the gate reports the agreement RATE per width, not a hard
+ * assert.  MoE down atomics are forced off (same rule as token-diff). */
+static int run_batch_check(ds4_session *session, ds4_engine *engine,
+                           const ds4_tokens *prompt,
+                           int frontier, int n_check) {
+    char err[256];
+    if (n_check > prompt->len - frontier) n_check = prompt->len - frontier;
+    n_check -= n_check % 60;   /* divisible by all widths 2..5 (and 60 = lcm) */
+    if (n_check <= 0) {
+        fprintf(stderr, "ds4-bench: batch-check needs >= 60 prompt tokens past the frontier\n");
+        return 1;
+    }
+    /* Same determinism rule as token-diff: atomic MoE down flips near-tie
+     * argmaxes run-to-run and would pollute the agreement rate. */
+    if (!getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN")) {
+        setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 0);
+        fprintf(stderr, "ds4-bench: DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 auto-set (batch-check)\n");
+    }
+
+    /* Full-logit reference for the first LOGIT_N positions (~32 MB): the
+     * width-1 pass below compares the complete vocab vector per position
+     * (max-abs + rms), a much stronger fidelity gate than argmax identity. */
+    enum { LOGIT_N = 64 };
+    const int n_vocab = ds4_engine_vocab_size(engine);
+    const int n_logit = n_check < LOGIT_N ? n_check : LOGIT_N;
+    float *ref_logits = malloc((size_t)n_logit * (size_t)n_vocab * sizeof(float));
+    int *plain_top = malloc((size_t)n_check * sizeof(int));
+    int *batch_top = malloc((size_t)n_check * sizeof(int));
+    if (!plain_top || !batch_top || !ref_logits) {
+        free(plain_top); free(batch_top); free(ref_logits);
+        return 1;
+    }
+
+    ds4_session_snapshot snap = {0};
+    int rc = 1;
+    if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: batch-check snapshot failed: %s\n", err);
+        goto done;
+    }
+
+    for (int i = 0; i < n_check; i++) {
+        if (ds4_session_eval(session, prompt->v[frontier + i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: batch-check plain eval at +%d failed: %s\n", i, err);
+            goto done;
+        }
+        plain_top[i] = ds4_session_argmax(session);
+        if (i < n_logit)
+            ds4_session_copy_logits(session, ref_logits + (size_t)i * n_vocab, n_vocab);
+    }
+
+    printf("batch-check: ctx=%d n=%d (plain argmax reference captured)\n", frontier, n_check);
+
+    /* Width-1 pass: replay every position individually through the batch
+     * forward and compare the FULL logit vector against the plain reference. */
+    if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: batch-check restore failed: %s\n", err);
+        goto done;
+    }
+    {
+        double worst_abs = 0.0, worst_rms = 0.0;
+        int worst_pos = -1, w1_mis = 0;
+        float *cur = malloc((size_t)n_vocab * sizeof(float));
+        if (!cur) goto done;
+        for (int i = 0; i < n_logit; i++) {
+            if (ds4_session_eval_batch_replay(session, prompt->v + frontier + i, 1,
+                                              err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: batch-check replay w=1 at +%d failed: %s\n",
+                        i, err);
+                free(cur);
+                goto done;
+            }
+            if (ds4_session_argmax(session) != plain_top[i]) w1_mis++;
+            ds4_session_copy_logits(session, cur, n_vocab);
+            const float *ref = ref_logits + (size_t)i * n_vocab;
+            double sumsq = 0.0, mx = 0.0;
+            for (int v = 0; v < n_vocab; v++) {
+                const double d = fabs((double)cur[v] - (double)ref[v]);
+                if (d > mx) mx = d;
+                sumsq += d * d;
+            }
+            const double rms = sqrt(sumsq / n_vocab);
+            if (mx > worst_abs) { worst_abs = mx; worst_pos = i; }
+            if (rms > worst_rms) worst_rms = rms;
+        }
+        free(cur);
+        printf("batch-check: w=1 logits over %d positions: worst_maxabs=%.6f (at +%d) "
+               "worst_rms=%.6f argmax_mismatches=%d\n",
+               n_logit, worst_abs, worst_pos, worst_rms, w1_mis);
+    }
+    for (int w = 2; w <= 5; w++) {
+        if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4-bench: batch-check restore failed: %s\n", err);
+            goto done;
+        }
+        for (int pos = 0; pos < n_check; pos += w) {
+            if (ds4_session_eval_batch_replay(session, prompt->v + frontier + pos, w,
+                                              err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: batch-check replay w=%d at +%d failed: %s\n",
+                        w, pos, err);
+                goto done;
+            }
+            /* The wrapper exposes only the LAST row's logits, so each width w
+             * samples positions ≡ w-1 (mod w).  Across w=2..5 that covers most
+             * positions; the agreement rate over the sampled subset is the
+             * gate, not exhaustive per-position equality. */
+            batch_top[pos + w - 1] = ds4_session_argmax(session);
+        }
+        int n_cmp = 0, n_mis = 0, first_mis = -1;
+        for (int i = w - 1; i < n_check; i += w) {
+            n_cmp++;
+            if (batch_top[i] != plain_top[i]) {
+                n_mis++;
+                if (first_mis < 0) first_mis = i;
+            }
+        }
+        if (first_mis < 0) {
+            printf("batch-check: w=%d compared=%d mismatches=0 (100.00%% agree)\n",
+                   w, n_cmp);
+        } else {
+            printf("batch-check: w=%d compared=%d mismatches=%d (%.2f%% agree) "
+                   "first_mismatch=+%d\n",
+                   w, n_cmp, n_mis, 100.0 * (n_cmp - n_mis) / n_cmp, first_mis);
+        }
+    }
+    rc = 0;
+done:
+    ds4_session_snapshot_free(&snap);
+    free(ref_logits);
+    free(plain_top);
+    free(batch_top);
+    return rc;
+}
+
+static int run_batch_cost(ds4_session *session, const ds4_tokens *prompt,
+                          int frontier, FILE *out, int only_w) {
+    enum { WMAX = 5, ROUNDS = 16, WARMUP = 2 };
+    const int per_round = WMAX * (WMAX + 1) / 2;   /* sum of widths 1..WMAX */
+    char err[256];
+
+    const int w_lo = only_w > 0 ? only_w : 1;
+    const int w_hi = only_w > 0 ? only_w : WMAX;
+    const int round_toks = only_w > 0 ? only_w : per_round;
+
+    const int avail = prompt->len - frontier;
+    int rounds = ROUNDS;
+    while (rounds > 1 && (WARMUP + rounds) * round_toks > avail) rounds--;
+    if ((WARMUP + rounds) * round_toks > avail) {
+        fprintf(stderr, "ds4-bench: batch-cost needs >= %d prompt tokens past the "
+                        "frontier (%d available)\n",
+                (WARMUP + 1) * round_toks, avail);
+        return 1;
+    }
+    if (rounds < ROUNDS)
+        fprintf(stderr, "ds4-bench: batch-cost rounds trimmed to %d (short prompt)\n",
+                rounds);
+
+    double sum[WMAX + 1] = {0}, sumsq[WMAX + 1] = {0};
+    int cnt[WMAX + 1] = {0};
+    int pos = frontier;
+    for (int r = 0; r < WARMUP + rounds; r++) {
+        for (int w = w_lo; w <= w_hi; w++) {
+            const double t0 = bench_now_sec();
+            if (ds4_session_eval_batch_replay(session, prompt->v + pos, w,
+                                              err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: batch replay w=%d at pos %d failed: %s\n",
+                        w, pos, err);
+                return 1;
+            }
+            const double ms = (bench_now_sec() - t0) * 1000.0;
+            pos += w;
+            if (r >= WARMUP) {
+                sum[w] += ms;
+                sumsq[w] += ms * ms;
+                cnt[w]++;
+            }
+        }
+    }
+
+    const double ms1 = cnt[1] ? sum[1] / cnt[1] : 0.0;
+    for (int w = w_lo; w <= w_hi; w++) {
+        const double mean = sum[w] / cnt[w];
+        const double var = cnt[w] > 1
+            ? (sumsq[w] - sum[w] * sum[w] / cnt[w]) / (cnt[w] - 1) : 0.0;
+        fprintf(out, "%d,%d,%d,%.2f,%.2f,%.2f,%.3f\n",
+                frontier, w, cnt[w], mean, var > 0.0 ? sqrt(var) : 0.0,
+                1000.0 * (double)w / mean,
+                ms1 > 0.0 ? ((double)w / mean) / (1.0 / ms1) : 0.0);
+        fflush(out);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -524,6 +790,8 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .mtp_path = cfg.mtp_path,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -534,23 +802,25 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
     log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
-    char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
-    if (cfg.chat_prompt_path) {
-        ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
-    } else {
-        ds4_tokenize_text(engine, text, &prompt);
-    }
-    free(text);
+    if (!cfg.kv_restore_path) {
+        char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
+        if (cfg.chat_prompt_path) {
+            ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
+        } else {
+            ds4_tokenize_text(engine, text, &prompt);
+        }
+        free(text);
 
-    if (prompt.len < cfg.ctx_max) {
-        fprintf(stderr,
-                "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
-                prompt.len,
-                cfg.ctx_max);
-        ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
-        return 1;
+        if (prompt.len < cfg.ctx_max) {
+            fprintf(stderr,
+                    "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
+                    prompt.len,
+                    cfg.ctx_max);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     ds4_session *session = NULL;
@@ -581,39 +851,105 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, cfg.batch_cost
+            ? "ctx_tokens,width,steps,ms_mean,ms_std,agg_tps,agg_speedup_vs_w1\n"
+            : "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool use_mtp = cfg.mtp_path != NULL && ds4_engine_mtp_draft_tokens(engine) > 1;
+    /* Optional decode-token dump for logit-equivalence cross-checks. */
+    FILE *tdump = NULL;
+    {
+        const char *tdpath = getenv("DS4_BENCH_TOKEN_DUMP");
+        if (tdpath && tdpath[0]) {
+            /* Greedy token-diff is only a valid gate if the MoE down-proj is
+             * deterministic: with scheduling-order atomicAdd (the n_tokens>=128
+             * default) f32 rounding can flip argmax run-to-run, which has
+             * false-reverted good changes (C13/C20). Force the ordered path so
+             * an operator can't forget. overwrite=0 respects an explicit
+             * DS4_CUDA_MOE_NO_ATOMIC_DOWN=0 for those intentionally testing the
+             * nondeterministic path. */
+            if (!getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN")) {
+                setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 0);
+                fprintf(stderr, "ds4-bench: DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 auto-set "
+                                "(token-diff requested; ordered MoE down for determinism)\n");
+            }
+            tdump = fopen(tdpath, "w");
+            if (!tdump)
+                fprintf(stderr, "ds4-bench: token dump open %s: %s\n", tdpath, strerror(errno));
+        }
+    }
+    fprintf(stderr, "ds4-bench: decode path = %s\n",
+            use_mtp ? "MTP speculative combined-forward" : "plain");
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
     int rc = 0;
 
+    if (cfg.kv_restore_path) {
+        FILE *fp = fopen(cfg.kv_restore_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ds4-bench: open %s: %s\n",
+                    cfg.kv_restore_path, strerror(errno));
+            rc = 1;
+            goto cleanup;
+        }
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        if (!ds4_kvstore_read_header(fp, &hdr, &text_bytes)) {
+            fprintf(stderr, "ds4-bench: invalid KV header in %s\n", cfg.kv_restore_path);
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        if (text_bytes && fseek(fp, (long)text_bytes, SEEK_CUR) != 0) {
+            fprintf(stderr, "ds4-bench: seek past text: %s\n", strerror(errno));
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        /* Title trailer (if EXT_SESSION_TITLE) sits AFTER the payload — ignore it. */
+        char load_err[160] = {0};
+        if (ds4_session_load_payload(session, fp, hdr.payload_bytes,
+                                     load_err, sizeof(load_err)) != 0) {
+            fprintf(stderr, "ds4-bench: load_payload: %s\n",
+                    load_err[0] ? load_err : "unknown");
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        fclose(fp);
+        const int loaded_pos = (int)hdr.tokens;
+        fprintf(stderr, "ds4-bench: restored %d tokens from %s\n",
+                loaded_pos, cfg.kv_restore_path);
+        cfg.ctx_start = loaded_pos;
+        cfg.ctx_max = loaded_pos;
+        previous = loaded_pos;
+    }
+
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+        double prefill_sec = 0.0;
+        int prefill_tokens = 0;
         ds4_tokens prefix = {
             .v = prompt.v,
             .len = frontier,
             .cap = frontier,
         };
 
-        const double prefill_t0 = bench_now_sec();
-        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
-            rc = 1;
-            break;
+        if (!cfg.kv_restore_path) {
+            const double prefill_t0 = bench_now_sec();
+            if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
+            const double prefill_t1 = bench_now_sec();
+            prefill_sec = prefill_t1 - prefill_t0;
+            prefill_tokens = frontier - previous;
         }
-        const double prefill_t1 = bench_now_sec();
-        const double prefill_sec = prefill_t1 - prefill_t0;
-        const int prefill_tokens = frontier - previous;
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
+        if ((cfg.gen_tokens > 0 || cfg.batch_cost) && !distributed) {
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -621,23 +957,74 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (cfg.batch_cost && !distributed) {
+            const int bc_rc = cfg.batch_check > 0
+                ? run_batch_check(session, engine, &prompt, frontier, cfg.batch_check)
+                : run_batch_cost(session, &prompt, frontier, out, cfg.batch_cost_w);
+            if (bc_rc != 0) {
+                rc = 1;
+                break;
+            }
+            if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
+            previous = frontier;
+            if (frontier >= cfg.ctx_max) break;
+            continue;
+        }
+
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        const bool sampled = cfg.temperature > 0.0f;
+        uint64_t rng = cfg.seed;   /* reset per frontier for reproducible sampled runs */
+        int produced = 0;
+        while (produced < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
+            /* Greedy default keeps rows comparable; --temp>0 measures the real
+             * sampled decode path (spec-sampling when --mtp).  Sampled spec calls
+             * pass eos=-1 so generation never early-stops (full gen_tokens/row). */
+            const int token = sampled
+                ? ds4_session_sample(session, cfg.temperature, 0, cfg.top_p, cfg.min_p, &rng)
+                : ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (use_mtp) {
+                /* Speculative decode: one batched verifier forward advances
+                 * the accepted prefix (first_token + matching drafts).  Mirrors
+                 * the CLI/server decode path so the bench measures the real
+                 * --mtp throughput, not a separate code path. */
+                int toks[17];
+                const int ntok = sampled
+                    ? ds4_session_eval_speculative_sample(
+                        session, token, cfg.gen_tokens - produced, /*eos*/ -1,
+                        cfg.temperature, 0, cfg.top_p, cfg.min_p, &rng,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err))
+                    : ds4_session_eval_speculative_argmax(
+                        session, token, cfg.gen_tokens - produced, eos,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: spec decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (tdump) for (int i = 0; i < ntok; i++) fprintf(tdump, "%d\n", toks[i]);
+                produced += ntok;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (tdump) fprintf(tdump, "%d\n", token);
+                produced += 1;
             }
         }
         const double gen_t1 = bench_now_sec();
@@ -665,8 +1052,8 @@ int main(int argc, char **argv) {
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                produced,
+                gen_sec > 0.0 ? (double)produced / gen_sec : 0.0,
                 (unsigned long long)(distributed ? 0 : snap.len));
         fflush(out);
 
@@ -674,6 +1061,8 @@ int main(int argc, char **argv) {
         if (frontier >= cfg.ctx_max) break;
     }
 
+cleanup:
+    if (tdump) fclose(tdump);
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);

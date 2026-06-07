@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset=utf-8><title>DS4 GB10 — 3-way comparison</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;max-width:1080px;color:#1a1a1a}
+h1{margin-bottom:.2rem}.sub{color:#666;margin-bottom:1.4rem}table{border-collapse:collapse;margin:.6rem 0;font-variant-numeric:tabular-nums}
+td,th{border:1px solid #ddd;padding:4px 10px;text-align:right}th{background:#f4f4f4}.card{background:#f8f9fb;border:1px solid #e3e6ec;border-radius:8px;padding:.8rem 1.2rem;display:inline-block;margin:.3rem .6rem .3rem 0;vertical-align:top}
+.big{font-size:1.5rem;font-weight:700}.lbl{color:#666;font-size:.8rem}img{max-width:48%;border:1px solid #eee;margin:.3rem}
+.note{background:#fff8e1;border:1px solid #ffe082;border-radius:6px;padding:.6rem 1rem;margin:1rem 0;font-size:.92rem}</style></head><body>
+<h1>DeepSeek-V4-Flash on GB10 — upstream main → PR3 → current</h1>
+<div class=sub>promessi_sposi · greedy gen=128 · warm · IQ2_XXS</div>
+<div>
+<span class=card><div class=lbl>upstream main</div><div class=big>13.2 t/s</div><div class=lbl>plain, ≤8k only</div></span>
+<span class=card><div class=lbl>PR3 (3 GB10 PRs)</div><div class=big>14.4 t/s</div><div class=lbl>MTP, full 64k</div></span>
+<span class=card><div class=lbl>current</div><div class=big>14.6 t/s</div><div class=lbl>MTP, full 64k</div></span>
+<span class=card><div class=lbl>MTP vs plain</div><div class=big>+10.7%</div></span>
+</div>
+<div class=note><b>main can't fit large context</b> — upstream OOMs the GB10 above ~8k ctx (lacks PR1's HBM-resident VMM mapping) and its <code>ds4-bench</code> has no <code>--mtp</code> (combined-forward is PR2 work). So main is plain-only, ≤8k.</div>
+<div><img src="cmp_plain.svg"><img src="cmp_mtp.svg"></div>
+<h3>Plain decode, common range (prefill / tg)</h3>
+<table><tr><th>ctx</th><th>main</th><th>PR3</th><th>current</th></tr><tr><td>2,048</td><td>99/12.53</td><td>396/14.17</td><td>419/14.36</td></tr><tr><td>4,096</td><td>396/13.51</td><td>405/14.20</td><td>405/14.40</td></tr><tr><td>6,144</td><td>388/13.52</td><td>398/14.17</td><td>398/14.33</td></tr><tr><td>8,192</td><td>384/13.37</td><td>394/13.96</td><td>392/14.15</td></tr></table>
+<h3>Progression (geomean tg)</h3>
+<table><tr><th></th><th>main→PR3</th><th>PR3→current</th></tr>
+<tr><td>plain (2k-8k)</td><td>13.23→14.12 (+7%)</td><td>14.12→14.31 (+1%)</td></tr>
+<tr><td>MTP (2k-64k)</td><td>n/a (no MTP bench)</td><td>14.38→14.61 (+1.6%)</td></tr></table>
+<p style="color:#666;font-size:.85rem">main→PR3: GB10 enablement (HBM-resident lets 64k ctx fit, share-warp Q8 +decode, MTP combined-forward +10.7%). PR3→current: session work (moe_down, f16 prewarm) — modest at long ctx; biggest where this sweep doesn't look (short-ctx decode, short-prompt TTFT ~2x).</p>
+</body></html>

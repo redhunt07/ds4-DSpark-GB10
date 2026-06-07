@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR #1 — CUDA Correctness Gate · Primer</title>
+<style>
+:root {
+  --bg:#0e1116; --panel:#161b22; --fg:#d6deeb; --muted:#8b98b0; --line:#222b38;
+  --accent:#7ee787; --accent2:#79c0ff; --code-bg:#11151c; --warn:#f0c674;
+}
+* { box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body {
+  margin:0; background:var(--bg); color:var(--fg);
+  font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap { display:grid; grid-template-columns:280px minmax(0,1fr); gap:0; max-width:1400px; margin:0 auto; }
+nav {
+  position:sticky; top:0; align-self:start; height:100vh; overflow-y:auto;
+  padding:28px 18px 60px; border-right:1px solid var(--line); background:var(--panel);
+  font-size:13.5px;
+}
+nav .toctitle { display:none; }
+nav ul { list-style:none; margin:0; padding-left:12px; }
+nav > ul { padding-left:0; }
+nav a { color:var(--muted); text-decoration:none; display:block; padding:3px 6px; border-radius:5px; }
+nav a:hover { color:var(--fg); background:#1f2733; }
+main { padding:40px 56px 120px; min-width:0; }
+main > h1:first-child { margin-top:0; }
+h1,h2,h3,h4 { line-height:1.25; font-weight:650; }
+h1 { font-size:30px; letter-spacing:-.01em; border-bottom:1px solid var(--line); padding-bottom:14px; }
+h2 { font-size:23px; margin-top:48px; color:#fff; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { font-size:18.5px; margin-top:32px; color:var(--accent2); }
+h4 { font-size:16px; margin-top:24px; color:var(--accent); }
+a { color:var(--accent2); }
+p, li { color:var(--fg); }
+em { color:var(--muted); }
+strong { color:#fff; font-weight:650; }
+hr { border:0; border-top:1px solid var(--line); margin:40px 0; }
+code {
+  font:13.5px/1.5 "JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  background:var(--code-bg); padding:.12em .4em; border-radius:5px; color:#e6b673;
+  border:1px solid #1c2430;
+}
+pre { margin:18px 0; }
+.codehilite {
+  background:var(--code-bg); border:1px solid var(--line); border-radius:10px;
+  padding:16px 18px; overflow-x:auto; box-shadow:0 1px 0 #0a0d12 inset;
+}
+.codehilite pre { margin:0; }
+.codehilite code { background:none; border:0; padding:0; color:inherit; font-size:13.5px; line-height:1.55; }
+table { border-collapse:collapse; margin:20px 0; width:100%; font-size:14.5px; }
+th,td { border:1px solid var(--line); padding:8px 12px; text-align:left; vertical-align:top; }
+th { background:#1b2330; color:#fff; font-weight:600; }
+tr:nth-child(even) td { background:#12171f; }
+blockquote { border-left:3px solid var(--accent); margin:18px 0; padding:2px 18px; color:var(--muted); background:#12171f; border-radius:0 8px 8px 0; }
+.banner {
+  background:linear-gradient(90deg,#11202a,#161b22); border:1px solid var(--line);
+  border-radius:10px; padding:14px 18px; margin:0 0 28px; font-size:14px; color:var(--muted);
+}
+.banner b { color:var(--accent); }
+@media (max-width:900px) {
+  .wrap { grid-template-columns:1fr; }
+  nav { position:static; height:auto; border-right:0; border-bottom:1px solid var(--line); }
+  main { padding:28px 22px 80px; }
+}
+pre { line-height: 125%; }
+td.linenos .normal { color: #f1fa8c; background-color: #44475a; padding-left: 5px; padding-right: 5px; }
+span.linenos { color: #f1fa8c; background-color: #44475a; padding-left: 5px; padding-right: 5px; }
+td.linenos .special { color: #50fa7b; background-color: #6272a4; padding-left: 5px; padding-right: 5px; }
+span.linenos.special { color: #50fa7b; background-color: #6272a4; padding-left: 5px; padding-right: 5px; }
+.codehilite .hll { background-color: #44475a }
+.codehilite { background: #282a36; color: #f8f8f2 }
+.codehilite .c { color: #6272a4 } /* Comment */
+.codehilite .err { color: #f8f8f2 } /* Error */
+.codehilite .g { color: #f8f8f2 } /* Generic */
+.codehilite .k { color: #ff79c6 } /* Keyword */
+.codehilite .l { color: #f8f8f2 } /* Literal */
+.codehilite .n { color: #f8f8f2 } /* Name */
+.codehilite .o { color: #ff79c6 } /* Operator */
+.codehilite .x { color: #f8f8f2 } /* Other */
+.codehilite .p { color: #f8f8f2 } /* Punctuation */
+.codehilite .ch { color: #6272a4 } /* Comment.Hashbang */
+.codehilite .cm { color: #6272a4 } /* Comment.Multiline */
+.codehilite .cp { color: #ff79c6 } /* Comment.Preproc */
+.codehilite .cpf { color: #6272a4 } /* Comment.PreprocFile */
+.codehilite .c1 { color: #6272a4 } /* Comment.Single */
+.codehilite .cs { color: #6272a4 } /* Comment.Special */
+.codehilite .gd { color: #8b080b } /* Generic.Deleted */
+.codehilite .ge { color: #f8f8f2; text-decoration: underline } /* Generic.Emph */
+.codehilite .ges { color: #f8f8f2; text-decoration: underline } /* Generic.EmphStrong */
+.codehilite .gr { color: #f8f8f2 } /* Generic.Error */
+.codehilite .gh { color: #f8f8f2; font-weight: bold } /* Generic.Heading */
+.codehilite .gi { color: #f8f8f2; font-weight: bold } /* Generic.Inserted */
+.codehilite .go { color: #44475a } /* Generic.Output */
+.codehilite .gp { color: #f8f8f2 } /* Generic.Prompt */
+.codehilite .gs { color: #f8f8f2 } /* Generic.Strong */
+.codehilite .gu { color: #f8f8f2; font-weight: bold } /* Generic.Subheading */
+.codehilite .gt { color: #f8f8f2 } /* Generic.Traceback */
+.codehilite .kc { color: #ff79c6 } /* Keyword.Constant */
+.codehilite .kd { color: #8be9fd; font-style: italic } /* Keyword.Declaration */
+.codehilite .kn { color: #ff79c6 } /* Keyword.Namespace */
+.codehilite .kp { color: #ff79c6 } /* Keyword.Pseudo */
+.codehilite .kr { color: #ff79c6 } /* Keyword.Reserved */
+.codehilite .kt { color: #8be9fd } /* Keyword.Type */
+.codehilite .ld { color: #f8f8f2 } /* Literal.Date */
+.codehilite .m { color: #ffb86c } /* Literal.Number */
+.codehilite .s { color: #bd93f9 } /* Literal.String */
+.codehilite .na { color: #50fa7b } /* Name.Attribute */
+.codehilite .nb { color: #8be9fd; font-style: italic } /* Name.Builtin */
+.codehilite .nc { color: #50fa7b } /* Name.Class */
+.codehilite .no { color: #f8f8f2 } /* Name.Constant */
+.codehilite .nd { color: #f8f8f2 } /* Name.Decorator */
+.codehilite .ni { color: #f8f8f2 } /* Name.Entity */
+.codehilite .ne { color: #f8f8f2 } /* Name.Exception */
+.codehilite .nf { color: #50fa7b } /* Name.Function */
+.codehilite .nl { color: #8be9fd; font-style: italic } /* Name.Label */
+.codehilite .nn { color: #f8f8f2 } /* Name.Namespace */
+.codehilite .nx { color: #f8f8f2 } /* Name.Other */
+.codehilite .py { color: #f8f8f2 } /* Name.Property */
+.codehilite .nt { color: #ff79c6 } /* Name.Tag */
+.codehilite .nv { color: #8be9fd; font-style: italic } /* Name.Variable */
+.codehilite .ow { color: #ff79c6 } /* Operator.Word */
+.codehilite .pm { color: #f8f8f2 } /* Punctuation.Marker */
+.codehilite .w { color: #f8f8f2 } /* Text.Whitespace */
+.codehilite .mb { color: #ffb86c } /* Literal.Number.Bin */
+.codehilite .mf { color: #ffb86c } /* Literal.Number.Float */
+.codehilite .mh { color: #ffb86c } /* Literal.Number.Hex */
+.codehilite .mi { color: #ffb86c } /* Literal.Number.Integer */
+.codehilite .mo { color: #ffb86c } /* Literal.Number.Oct */
+.codehilite .sa { color: #bd93f9 } /* Literal.String.Affix */
+.codehilite .sb { color: #bd93f9 } /* Literal.String.Backtick */
+.codehilite .sc { color: #bd93f9 } /* Literal.String.Char */
+.codehilite .dl { color: #bd93f9 } /* Literal.String.Delimiter */
+.codehilite .sd { color: #bd93f9 } /* Literal.String.Doc */
+.codehilite .s2 { color: #bd93f9 } /* Literal.String.Double */
+.codehilite .se { color: #bd93f9 } /* Literal.String.Escape */
+.codehilite .sh { color: #bd93f9 } /* Literal.String.Heredoc */
+.codehilite .si { color: #bd93f9 } /* Literal.String.Interpol */
+.codehilite .sx { color: #bd93f9 } /* Literal.String.Other */
+.codehilite .sr { color: #bd93f9 } /* Literal.String.Regex */
+.codehilite .s1 { color: #bd93f9 } /* Literal.String.Single */
+.codehilite .ss { color: #bd93f9 } /* Literal.String.Symbol */
+.codehilite .bp { color: #f8f8f2; font-style: italic } /* Name.Builtin.Pseudo */
+.codehilite .fm { color: #50fa7b } /* Name.Function.Magic */
+.codehilite .vc { color: #8be9fd; font-style: italic } /* Name.Variable.Class */
+.codehilite .vg { color: #8be9fd; font-style: italic } /* Name.Variable.Global */
+.codehilite .vi { color: #8be9fd; font-style: italic } /* Name.Variable.Instance */
+.codehilite .vm { color: #8be9fd; font-style: italic } /* Name.Variable.Magic */
+.codehilite .il { color: #ffb86c } /* Literal.Number.Integer.Long */
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav><div class="toc"><span class="toctitle">Contents</span><ul>
+<li><a href="#pr-1-cuda-correctness-gate-a-literate-primer">PR #1 — CUDA Correctness Gate: A Literate Primer</a><ul>
+<li><a href="#0-the-thesis-why-this-pr-exists-at-all">0. The thesis (why this PR exists at all)</a></li>
+<li><a href="#1-topology-whats-additive-what-it-leans-on">1. Topology — what's additive, what it leans on</a></li>
+<li><a href="#2-three-gates-and-why-exactly-three">2. Three gates, and why exactly three</a></li>
+<li><a href="#3-ds4_cuda_tensor_equivalence_selftest-the-core-walked">3. ds4_cuda_tensor_equivalence_selftest — the core, walked</a><ul>
+<li><a href="#31-out-params-zeroed-first-then-the-guards">3.1 Out-params zeroed first, then the guards</a></li>
+<li><a href="#32-the-determinism-knob-and-why-its-savedrestored">3.2 The determinism knob — and why it's saved/restored</a></li>
+<li><a href="#33-buffers-and-the-hidden-channel-layout">3.3 Buffers and the hidden-channel layout</a></li>
+<li><a href="#34-graph-alloc-the-materialize_ffn_out-flag">3.4 Graph alloc + the materialize_ffn_out flag</a></li>
+<li><a href="#35-seed-the-forward-embed-the-first-token">3.5 Seed the forward: embed the first token</a></li>
+<li><a href="#36-the-per-layer-teacher-forced-loop-the-key-idea">3.6 The per-layer teacher-forced loop — the key idea</a></li>
+<li><a href="#37-the-metric-why-relative-rms-not-absolute">3.7 The metric — why relative RMS, not absolute</a></li>
+<li><a href="#38-bookkeeping-the-verbose-gate-double-buffer-swap">3.8 Bookkeeping, the verbose gate, double-buffer swap</a></li>
+<li><a href="#39-teardown-symmetric-and-leak-free">3.9 Teardown — symmetric and leak-free</a></li>
+</ul>
+</li>
+<li><a href="#4-the-perplexity-harness-testsds4_testc">4. The perplexity harness (tests/ds4_test.c)</a><ul>
+<li><a href="#41-test_ppl_score-backend-agnostic-avg-nll">4.1 test_ppl_score — backend-agnostic avg-NLL</a></li>
+<li><a href="#42-test_cuda_perplexity-self-regression-with-a-stale-baseline-tripwire">4.2 test_cuda_perplexity — self-regression with a stale-baseline tripwire</a></li>
+<li><a href="#43-test_cpu_cuda_ppl-capture-vs-check-and-why-the-cpu-ref-is-truth">4.3 test_cpu_cuda_ppl — capture vs check, and why the CPU ref is truth</a></li>
+</ul>
+</li>
+<li><a href="#5-the-numbers-youre-standing-behind">5. The numbers you're standing behind</a></li>
+<li><a href="#6-backend-behavior-matrix-so-you-can-answer-does-this-break-my-mac">6. Backend behavior matrix (so you can answer "does this break my Mac?")</a></li>
+<li><a href="#7-what-changed-across-the-three-review-passes-the-provenance">7. What changed across the three review passes (the provenance)</a></li>
+<li><a href="#8-defend-it-qa-anticipated-antirez-questions">8. Defend-it Q&amp;A (anticipated antirez questions)</a></li>
+<li><a href="#9-run-it-where-it-lives">9. Run it / where it lives</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</nav>
+<main>
+<div class="banner"><b>Internal primer</b> — not part of the PR commit. Branch <code>prep/correctness-gate</code> (<code>8950efb</code>), fork-only, no upstream PR open.</div>
+<h1 id="pr-1-cuda-correctness-gate-a-literate-primer">PR #1 — CUDA Correctness Gate: A Literate Primer</h1>
+<p><em>Branch:</em> <code>prep/correctness-gate</code> (<code>8950efb</code>) on <code>TrevorS/ds4</code>, one commit on <code>upstream/main</code> (<code>59d9bc7</code>).
+<em>Shape:</em> <code>+~555 / −1</code>, 9 files, <strong>purely additive</strong> — no inference path is modified.</p>
+<p>This is written so you can own the PR: defend every line, answer antirez's questions,
+and regenerate or extend it without me. It walks the real committed code in reading
+order. It assumes you (skips C/CUDA/quant basics) and dwells only on the design
+rationale and the non-obvious.</p>
+<hr />
+<h2 id="0-the-thesis-why-this-pr-exists-at-all">0. The thesis (why this PR exists at all)</h2>
+<p>antirez merged your GB10 work (#13), then <strong>reverted</strong> it; he <strong>declined</strong> the MTP work
+(#14). Both for the same reason: <em>correctness he could not independently verify.</em> His
+words after the revert: he'd be cautious merging CUDA changes "not tested for
+correctness in a very deep way." Critically — our old <strong>token-diff</strong> gate <em>masked</em> the
+RMS-0.2 divergence he caught by hand. Token-diff only compares final sampled token
+streams; it integrates over everything and only trips when drift is large enough to
+flip a greedy argmax. A 0.2-RMS hidden-state error that doesn't (yet) flip the top
+token sails straight through.</p>
+<p>So PR #1 is <strong>not</strong> a perf change. It is the <strong>instrument</strong>: three CUDA correctness
+gates that would have caught exactly what burned him, handed over <em>before</em> we
+re-submit any kernel work. Every later PR (#2 MTP, #3 GB10 HBM) then ships <em>with its
+proof attached</em> (<code>make cuda-ppl</code>, <code>--mtp-correctness</code>). That's the strategic point you're
+taking responsibility for: we're rebuilding trust by giving him the ruler, not another
+thing to measure.</p>
+<hr />
+<h2 id="1-topology-whats-additive-what-it-leans-on">1. Topology — what's additive, what it leans on</h2>
+<p>The entire PR is new symbols. Nothing upstream is edited except <em>insertion points</em>:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What's added</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ds4.h</code></td>
+<td>1 decl: <code>ds4_cuda_tensor_equivalence_selftest</code></td>
+</tr>
+<tr>
+<td><code>ds4.c</code></td>
+<td>1 function (the selftest, ~137 lines)</td>
+</tr>
+<tr>
+<td><code>tests/ds4_test.c</code></td>
+<td>6 statics (3 gates + 3 helpers) + 3 registry rows</td>
+</tr>
+<tr>
+<td><code>tests/test-vectors/</code></td>
+<td>4 files: 2 corpora, 2 baselines</td>
+</tr>
+<tr>
+<td><code>Makefile</code></td>
+<td><code>.PHONY</code> + 4 phony targets</td>
+</tr>
+<tr>
+<td><code>CONTRIBUTING.md</code></td>
+<td>doc block under <em>Correctness Regression Tests</em></td>
+</tr>
+</tbody>
+</table>
+<p>The reason it <em>can</em> be additive: every primitive the gates call already exists upstream
+— <code>ds4_session_create/sync/token_logprob/eval</code>, <code>metal_graph_alloc</code>,
+<code>metal_graph_encode_decode_layer</code>, <code>ds4_gpu_embed_token_hc_tensor</code>,
+<code>ds4_gpu_tensor_write/read</code>, <code>embed_token_f16</code>, <code>hc_from_plain_embedding</code>,
+<code>layer_forward_self_one</code>, <code>rms_abs_diff</code>, <code>max_abs_diff</code>, and the
+<code>g.materialize_ffn_out</code> graph field. We verified each is present in <code>upstream/main</code>.
+The selftest is, in effect, a <em>productized</em> copy of the already-in-tree diagnostic
+<code>metal_graph_first_token_full_test</code> (<code>ds4.c:15913</code>) — same alloc, same
+<code>materialize_ffn_out</code>, same per-layer teacher-forced loop — turned into an asserting
+gate. That sibling is your single best "this is idiomatic, not novel" defense.</p>
+<hr />
+<h2 id="2-three-gates-and-why-exactly-three">2. Three gates, and why exactly three</h2>
+<p>They form a <strong>layered argument</strong>, weakest-but-most-precise → strongest-but-coarsest:</p>
+<ol>
+<li>
+<p><strong><code>--cuda-tensor-equivalence</code></strong> — <em>per-layer, localizing.</em> Recomputes the forward
+   one layer at a time on both CUDA and CPU-f32 and RMS-diffs each layer's output.
+   Answers: <em>"if CUDA drifts, </em><em>which layer</em><em> first?"</em> This is the one that catches the
+   RMS-0.2 class antirez found — and points at the kernel responsible.</p>
+</li>
+<li>
+<p><strong><code>--cuda-ppl</code></strong> — <em>one integral scalar, self-regression.</em> Teacher-forces a fixed
+   corpus and compares avg-NLL to a committed self-baseline. Answers: <em>"did </em><em>my own</em><em>
+   kernels change vs the last blessed build?"</em> It integrates every layer's drift into
+   one number — the standard llama.cpp-style regression scalar.</p>
+</li>
+<li>
+<p><strong><code>--cpu-cuda-ppl</code></strong> — <em>cross-check vs ground truth.</em> Same scalar, but compared to a
+   committed <strong>CPU-f32</strong> reference instead of a CUDA self-baseline. Answers: <em>"is CUDA
+   </em><em>right at all</em><em>?"</em> — the claim a self-baseline structurally cannot make (a wrong
+   CUDA build is perfectly self-consistent).</p>
+</li>
+</ol>
+<p>The progression matters: (1) tells you <em>where</em>, (2) tells you <em>whether it moved</em>, (3)
+tells you <em>whether it was ever correct</em>. Token-diff sat above all three and saw none of
+it.</p>
+<hr />
+<h2 id="3-ds4_cuda_tensor_equivalence_selftest-the-core-walked">3. <code>ds4_cuda_tensor_equivalence_selftest</code> — the core, walked</h2>
+<p>The declaration (<code>ds4.h</code>) is the contract. It returns the <strong>number of failing layers</strong>
+(0 = pass) and fills optional diagnostics:</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="nf">ds4_cuda_tensor_equivalence_selftest</span><span class="p">(</span><span class="n">ds4_session</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">double</span><span class="w"> </span><span class="n">rms_tol</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">double</span><span class="w"> </span><span class="n">max_abs_tol</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">double</span><span class="w"> </span><span class="o">*</span><span class="n">out_worst_rms</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">double</span><span class="w"> </span><span class="o">*</span><span class="n">out_worst_max_abs</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">out_first_fail_layer</span><span class="p">,</span>
+<span class="w">                                         </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">out_nonfinite</span><span class="p">);</span>
+</code></pre></div>
+
+<h3 id="31-out-params-zeroed-first-then-the-guards">3.1 Out-params zeroed first, then the guards</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">out_worst_rms</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="n">out_worst_rms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.0</span><span class="p">;</span>
+<span class="w">    </span><span class="cm">/* ...zero all out-params... */</span>
+<span class="cp">#ifdef DS4_NO_GPU</span>
+<span class="w">    </span><span class="cm">/* ...requires a GPU build... */</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="cp">#else</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">!</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">engine</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">engine</span><span class="o">-&gt;</span><span class="n">backend</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">DS4_BACKEND_CUDA</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* ... */</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">checkpoint_valid</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">checkpoint</span><span class="p">.</span><span class="n">len</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* needs a synced prefix */</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+
+<p>Out-params are initialized <strong>before</strong> any early return so a caller never reads garbage.
+Three guard gates: GPU build, CUDA backend, and a synced prefix (we need at least one
+real token to forward). Each returns <code>1</code> (= "one failure") so a misconfigured call
+reads as a failed gate, not a silent pass.</p>
+<h3 id="32-the-determinism-knob-and-why-its-savedrestored">3.2 The determinism knob — and why it's saved/restored</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">prev_atomic</span><span class="p">[</span><span class="mi">32</span><span class="p">];</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">prev_atomic_env</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getenv</span><span class="p">(</span><span class="s">&quot;DS4_CUDA_MOE_NO_ATOMIC_DOWN&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="n">had_prev_atomic</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">prev_atomic_env</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">had_prev_atomic</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">strncpy</span><span class="p">(</span><span class="n">prev_atomic</span><span class="p">,</span><span class="w"> </span><span class="n">prev_atomic_env</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">prev_atomic</span><span class="p">)</span><span class="mi">-1</span><span class="p">);</span>
+<span class="w">                           </span><span class="n">prev_atomic</span><span class="p">[</span><span class="k">sizeof</span><span class="p">(</span><span class="n">prev_atomic</span><span class="p">)</span><span class="mi">-1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">&#39;\0&#39;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="n">setenv</span><span class="p">(</span><span class="s">&quot;DS4_CUDA_MOE_NO_ATOMIC_DOWN&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;1&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+</code></pre></div>
+
+<p>The MoE down-projection, at <code>n_tokens &gt;= 128</code>, accumulates via float <code>atomicAdd</code>
+(<code>use_atomic_down</code>). <code>atomicAdd</code> ordering is scheduling-dependent → ulp-scale variation
+<strong>run to run</strong>, which can occasionally flip a greedy argmax. For a gate that must be
+<em>bit-reproducible</em>, that's poison. <code>DS4_CUDA_MOE_NO_ATOMIC_DOWN=1</code> forces the ordered
+(deterministic) reduction. (This is the same knob that made <code>DS4_BENCH_TOKEN_DUMP</code>
+greedy gates deterministic — see your memory note on it.) It is <strong>CUDA-only</strong>; on Metal
+the symbol doesn't exist and the env is a harmless no-op.</p>
+<p>Why copy the string before <code>setenv</code>? <code>getenv</code> returns a pointer <em>into</em> <code>environ</code>;
+<code>setenv</code> can reallocate <code>environ</code> and invalidate it. So we snapshot, then set. And we
+restore at the end (§3.7) because this is a <strong>public</strong> function — a library hook that
+silently mutates process-global state and leaks it into the rest of an <code>--all</code> run is a
+real wart. This was a review-pass fix.</p>
+<h3 id="33-buffers-and-the-hidden-channel-layout">3.3 Buffers and the hidden-channel layout</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">hc_dim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint64_t</span><span class="p">)</span><span class="n">DS4_N_HC</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">DS4_N_EMBD</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">float</span><span class="w"> </span><span class="o">*</span><span class="n">plain</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="n">xmalloc</span><span class="p">(</span><span class="n">DS4_N_EMBD</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span><span class="w"> </span><span class="cm">/* plain embedding row     */</span>
+<span class="w">    </span><span class="kt">float</span><span class="w"> </span><span class="o">*</span><span class="n">cpu_cur</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">xmalloc</span><span class="p">(</span><span class="n">hc_dim</span><span class="w">     </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span><span class="w"> </span><span class="cm">/* CPU layer input          */</span>
+<span class="w">    </span><span class="kt">float</span><span class="w"> </span><span class="o">*</span><span class="n">cpu_next</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">xmalloc</span><span class="p">(</span><span class="n">hc_dim</span><span class="w">     </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span><span class="w"> </span><span class="cm">/* CPU layer output         */</span>
+<span class="w">    </span><span class="kt">float</span><span class="w"> </span><span class="o">*</span><span class="n">gpu_hc</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">xmalloc</span><span class="p">(</span><span class="n">hc_dim</span><span class="w">     </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span><span class="w"> </span><span class="cm">/* GPU layer output (readback)*/</span>
+</code></pre></div>
+
+<p><code>DS4_N_HC</code>/<code>DS4_N_EMBD</code>/<code>DS4_N_LAYER</code> are <strong>runtime</strong> shape values (<code>g_ds4_shape</code>), not
+compile-time — for Flash this is the 43-layer model you saw in the run. <code>hc_dim</code> is the
+per-token hidden-channel working-state width the graph materializes; the gate compares
+it <strong>element-wise</strong> (<code>hc_dim</code> floats) between CUDA and CPU at each layer boundary. All
+four buffers are <code>xmalloc</code> (which aborts on OOM, so no NULL checks needed) and freed
+unconditionally at the end.</p>
+<h3 id="34-graph-alloc-the-materialize_ffn_out-flag">3.4 Graph alloc + the <code>materialize_ffn_out</code> flag</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="n">ds4_gpu_graph</span><span class="w"> </span><span class="n">g</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">metal_graph_alloc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">g</span><span class="p">,</span><span class="w"> </span><span class="n">weights</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">weights</span><span class="o">-&gt;</span><span class="n">layer</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ok</span><span class="p">)</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">materialize_ffn_out</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span>
+</code></pre></div>
+
+<p><code>metal_graph_alloc</code> → <code>metal_graph_alloc_raw_cap</code>, whose <strong>first statement is
+<code>memset(g, 0, sizeof(*g))</code>.</strong> That single fact makes the whole error path safe: even if
+alloc fails, <code>g</code> is all-zero, so the <code>metal_graph_free(&amp;g)</code> at the end frees NULLs
+rather than walking uninitialized pointers. <code>materialize_ffn_out = true</code> tells the graph
+to keep each layer's post-FFN hidden state resident so we can read it back — without it
+the intermediate is consumed in place.</p>
+<h3 id="35-seed-the-forward-embed-the-first-token">3.5 Seed the forward: embed the first token</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="n">embed_token_f16</span><span class="p">(</span><span class="n">model</span><span class="p">,</span><span class="w"> </span><span class="n">weights</span><span class="p">,</span><span class="w"> </span><span class="n">token</span><span class="p">,</span><span class="w"> </span><span class="n">plain</span><span class="p">);</span><span class="w">                 </span><span class="cm">/* CPU side */</span>
+<span class="w">    </span><span class="n">hc_from_plain_embedding</span><span class="p">(</span><span class="n">cpu_cur</span><span class="p">,</span><span class="w"> </span><span class="n">plain</span><span class="p">,</span><span class="w"> </span><span class="n">DS4_N_EMBD</span><span class="p">,</span><span class="w"> </span><span class="n">DS4_N_HC</span><span class="p">);</span><span class="w"> </span><span class="cm">/* → hidden-channel form */</span>
+<span class="w">    </span><span class="n">ds4_gpu_begin_commands</span><span class="p">();</span>
+<span class="w">    </span><span class="n">ds4_gpu_embed_token_hc_tensor</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">cur_hc</span><span class="p">,</span><span class="w"> </span><span class="p">...</span><span class="n">token</span><span class="p">...);</span><span class="w">          </span><span class="cm">/* GPU side */</span>
+<span class="w">    </span><span class="n">ds4_gpu_end_commands</span><span class="p">();</span>
+</code></pre></div>
+
+<p>Both sides start from the <em>same</em> token (<code>s-&gt;checkpoint.v[0]</code>, the first synced token).
+CPU produces <code>cpu_cur</code> in hidden-channel form; GPU produces <code>g.cur_hc</code>. From here they
+march layer by layer.</p>
+<h3 id="36-the-per-layer-teacher-forced-loop-the-key-idea">3.6 The per-layer teacher-forced loop — the key idea</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">il</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">il</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">DS4_N_LAYER</span><span class="p">;</span><span class="w"> </span><span class="n">il</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* Teacher-force the GPU layer input from the CPU reference. */</span>
+<span class="w">        </span><span class="n">ds4_gpu_tensor_write</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">cur_hc</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">cpu_cur</span><span class="p">,</span><span class="w"> </span><span class="n">hc_dim</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span>
+<span class="w">        </span><span class="n">ds4_gpu_begin_commands</span><span class="p">();</span>
+<span class="w">        </span><span class="n">metal_graph_encode_decode_layer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">g</span><span class="p">,</span><span class="w"> </span><span class="n">model</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">weights</span><span class="o">-&gt;</span><span class="n">layer</span><span class="p">[</span><span class="n">il</span><span class="p">],</span><span class="w"> </span><span class="n">il</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                                         </span><span class="n">g</span><span class="p">.</span><span class="n">layer_raw_cache</span><span class="p">[</span><span class="n">il</span><span class="p">],</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">raw_cap</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">token</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ds4_gpu_tensor</span><span class="w"> </span><span class="o">*</span><span class="n">tmp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">cur_hc</span><span class="p">;</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">cur_hc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">after_ffn_hc</span><span class="p">;</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">after_ffn_hc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tmp</span><span class="p">;</span>
+<span class="w">        </span><span class="n">ds4_gpu_end_commands</span><span class="p">();</span>
+
+<span class="w">        </span><span class="n">layer_forward_self_one</span><span class="p">(</span><span class="n">cpu_next</span><span class="p">,</span><span class="w"> </span><span class="n">model</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">weights</span><span class="o">-&gt;</span><span class="n">layer</span><span class="p">[</span><span class="n">il</span><span class="p">],</span><span class="w"> </span><span class="n">cpu_cur</span><span class="p">,</span><span class="w"> </span><span class="n">il</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">token</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ds4_gpu_tensor_read</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">cur_hc</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">gpu_hc</span><span class="p">,</span><span class="w"> </span><span class="n">hc_dim</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span>
+</code></pre></div>
+
+<p><strong>This is the whole design.</strong> At the top of each layer we <em>overwrite</em> the GPU's input
+with the CPU reference (<code>ds4_gpu_tensor_write(g.cur_hc, ... cpu_cur ...)</code>). That's
+"teacher forcing": each layer is measured <strong>in isolation</strong>, fed the known-good input, so
+a layer's reported error is <em>its own</em> — not error inherited from upstream layers. Without
+this, a tiny L0 drift would compound through 43 layers and you'd only ever see "the end
+is off," never <em>which</em> layer started it. The teacher-force is what makes <code>first_fail_layer</code>
+meaningful.</p>
+<p>The pointer swap (<code>cur_hc ↔ after_ffn_hc</code>) is just reading the materialized output into
+<code>cur_hc</code> so the readback and the next iteration's write target line up. <code>cpu_next</code> is the
+CPU's independent recompute of the same layer.</p>
+<h3 id="37-the-metric-why-relative-rms-not-absolute">3.7 The metric — why <strong>relative</strong> RMS, not absolute</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">        </span><span class="kt">double</span><span class="w"> </span><span class="n">refsq</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">hc_dim</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">isfinite</span><span class="p">(</span><span class="n">gpu_hc</span><span class="p">[</span><span class="n">i</span><span class="p">]))</span><span class="w"> </span><span class="n">nonfinite</span><span class="o">++</span><span class="p">;</span>
+<span class="w">            </span><span class="n">refsq</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">cpu_next</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">cpu_next</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">ref_rms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sqrt</span><span class="p">(</span><span class="n">refsq</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">hc_dim</span><span class="p">);</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">denom</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">ref_rms</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">1e-9</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">ref_rms</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">;</span><span class="w">          </span><span class="cm">/* div-by-0 guard */</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">rel_rms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rms_abs_diff</span><span class="p">(</span><span class="n">cpu_next</span><span class="p">,</span><span class="w"> </span><span class="n">gpu_hc</span><span class="p">,</span><span class="w"> </span><span class="n">hc_dim</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">denom</span><span class="p">;</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">rel_mx</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">max_abs_diff</span><span class="p">(</span><span class="n">cpu_next</span><span class="p">,</span><span class="w"> </span><span class="n">gpu_hc</span><span class="p">,</span><span class="w"> </span><span class="n">hc_dim</span><span class="p">)</span><span class="w">  </span><span class="o">/</span><span class="w"> </span><span class="n">denom</span><span class="p">;</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="n">bad</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">rel_rms</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">rms_tol</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">(</span><span class="n">rel_mx</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">max_abs_tol</span><span class="p">);</span>
+</code></pre></div>
+
+<p>The residual stream <strong>grows in magnitude with depth</strong> (you can see it in the run:
+<code>ref_rms</code> climbs from tens at L26 to ~1300 by L41). An <em>absolute</em> RMS tolerance would
+therefore be far too loose at the deep layers (masking real drift) and far too tight at
+the shallow ones (false-flagging float noise). Normalizing the diff by the reference's
+own RMS gives a <strong>scale-invariant</strong> relative drift that is roughly uniform across depth
+when it's pure float noise — so one tolerance works for all 43 layers. <code>max_abs</code> is kept
+as a coarse "did something blow up" guard, also normalized. The <code>nonfinite</code> counter
+catches NaN/Inf in the GPU output directly (a separate failure axis).</p>
+<h3 id="38-bookkeeping-the-verbose-gate-double-buffer-swap">3.8 Bookkeeping, the verbose gate, double-buffer swap</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">bad</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">fails</span><span class="o">++</span><span class="p">;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">first_fail</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">first_fail</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">il</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">bad</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">te_verbose</span><span class="p">)</span>
+<span class="w">            </span><span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;ds4: cuda-tensor-equivalence L%u rel_rms=%g ...&quot;</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<span class="w">        </span><span class="cm">/* end if(ok) */</span>
+<span class="w">        </span><span class="kt">float</span><span class="w"> </span><span class="o">*</span><span class="n">ctmp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cpu_cur</span><span class="p">;</span><span class="w"> </span><span class="n">cpu_cur</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cpu_next</span><span class="p">;</span><span class="w"> </span><span class="n">cpu_next</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ctmp</span><span class="p">;</span><span class="w">   </span><span class="cm">/* this layer&#39;s output → next layer&#39;s input */</span>
+<span class="w">    </span><span class="p">}</span>
+</code></pre></div>
+
+<p><code>fails</code> counts every exceeding layer; <code>first_fail</code> records the first (the localization
+payload). The per-layer line prints <strong>only</strong> when that layer is bad <em>or</em>
+<code>DS4_TEST_TE_VERBOSE=1</code> — that's the quiet-by-default behavior from a review pass; a
+clean run emits just the summary line, full per-layer detail on demand. The final swap
+makes this layer's CPU output the next layer's CPU input (the CPU march; the GPU march is
+teacher-forced back to it at the next top-of-loop).</p>
+<h3 id="39-teardown-symmetric-and-leak-free">3.9 Teardown — symmetric and leak-free</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">ok</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* failed mid-forward */</span><span class="w"> </span><span class="n">fails</span><span class="o">++</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">nonfinite</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">fails</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="n">metal_graph_free</span><span class="p">(</span><span class="o">&amp;</span><span class="n">g</span><span class="p">);</span>
+<span class="w">    </span><span class="n">free</span><span class="p">(</span><span class="n">gpu_hc</span><span class="p">);</span><span class="w"> </span><span class="n">free</span><span class="p">(</span><span class="n">cpu_next</span><span class="p">);</span><span class="w"> </span><span class="n">free</span><span class="p">(</span><span class="n">cpu_cur</span><span class="p">);</span><span class="w"> </span><span class="n">free</span><span class="p">(</span><span class="n">plain</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">had_prev_atomic</span><span class="p">)</span><span class="w"> </span><span class="n">setenv</span><span class="p">(</span><span class="s">&quot;DS4_CUDA_MOE_NO_ATOMIC_DOWN&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">prev_atomic</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">else</span><span class="w">                 </span><span class="n">unsetenv</span><span class="p">(</span><span class="s">&quot;DS4_CUDA_MOE_NO_ATOMIC_DOWN&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="cm">/* write out-params; return fails; */</span>
+</code></pre></div>
+
+<p>Any mid-forward failure becomes a <code>fails++</code> (so the gate trips). Then free everything
+(safe even on alloc failure, §3.4), restore the env to exactly the caller's prior state,
+fill the diagnostics, return <code>fails</code>. There is exactly <strong>one</strong> exit after the <code>setenv</code>,
+which is why a single restore point is sufficient.</p>
+<hr />
+<h2 id="4-the-perplexity-harness-testsds4_testc">4. The perplexity harness (<code>tests/ds4_test.c</code>)</h2>
+<h3 id="41-test_ppl_score-backend-agnostic-avg-nll">4.1 <code>test_ppl_score</code> — backend-agnostic avg-NLL</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="cm">/* sync a 32-token prefix as context, then teacher-force the rest: */</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">scored</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">prefix_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">j</span><span class="p">;</span>
+<span class="w">        </span><span class="n">ds4_session_token_logprob</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="n">tokens</span><span class="p">.</span><span class="n">v</span><span class="p">[</span><span class="n">i</span><span class="p">],</span><span class="w"> </span><span class="o">&amp;</span><span class="n">score</span><span class="p">);</span><span class="w">  </span><span class="cm">/* logprob of the TRUE next token */</span>
+<span class="w">        </span><span class="n">nll</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">score</span><span class="p">.</span><span class="n">logprob</span><span class="p">;</span><span class="w">                              </span><span class="cm">/* accumulate −log p */</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">j</span><span class="o">+</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">scored</span><span class="p">)</span><span class="w"> </span><span class="n">ds4_session_eval</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="n">tokens</span><span class="p">.</span><span class="n">v</span><span class="p">[</span><span class="n">i</span><span class="p">],</span><span class="w"> </span><span class="p">...);</span><span class="w"> </span><span class="cm">/* advance with the true token */</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="o">*</span><span class="n">out_avg_nll</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">nll</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">scored</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Standard teacher-forced perplexity: sync 32 tokens of context, then for each subsequent
+true token ask the model its log-probability, accumulate <code>−logprob</code> (natural-log NLL),
+and step the session forward <strong>with the true token</strong> (teacher forcing, not the model's
+own sample). <code>avg_nll = Σ(−log p)/N</code>; perplexity is <code>exp(avg_nll)</code>. Lower = the model is
+less surprised by the real text. It's backend-agnostic — the caller hands it a CUDA or
+CPU engine, which is exactly what lets gate #3 run both.</p>
+<h3 id="42-test_cuda_perplexity-self-regression-with-a-stale-baseline-tripwire">4.2 <code>test_cuda_perplexity</code> — self-regression with a stale-baseline tripwire</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="n">setenv</span><span class="p">(</span><span class="s">&quot;DS4_CUDA_MOE_NO_ATOMIC_DOWN&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;1&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w">            </span><span class="cm">/* bit-reproducible scalar */</span>
+<span class="w">    </span><span class="n">test_ppl_score</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;tests/test-vectors/ppl-corpus.txt&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">avg_nll</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">scored</span><span class="p">);</span>
+<span class="w">    </span><span class="cm">/* compare to committed tests/test-vectors/ppl-baseline.txt: */</span>
+<span class="w">    </span><span class="n">TEST_ASSERT</span><span class="p">(</span><span class="n">scored</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">base_scored</span><span class="p">);</span><span class="w">                       </span><span class="cm">/* corpus/tokenizer moved → regen, don&#39;t fail-as-regression */</span>
+<span class="w">    </span><span class="n">TEST_ASSERT</span><span class="p">(</span><span class="n">fabs</span><span class="p">(</span><span class="n">avg_nll</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">base_avg</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">base_tol</span><span class="p">);</span><span class="w">         </span><span class="cm">/* the actual regression check */</span>
+</code></pre></div>
+
+<p>Two asserts, deliberately separate. <code>scored == base_scored</code> is a <strong>tripwire</strong>: if the
+corpus or tokenizer changed, the token count moves and the baseline is <em>stale</em>, not a
+model regression — so it fails loudly with a distinct cause (telling you to regenerate)
+rather than masquerading as a numeric drift. Then the real check: avg-NLL within
+<code>tol=0.03</code>. Regenerate the baseline after an <em>intentional</em> numeric change with
+<code>DS4_TEST_PPL_WRITE_BASELINE=1</code> (<code>make cuda-ppl-baseline</code>).</p>
+<h3 id="43-test_cpu_cuda_ppl-capture-vs-check-and-why-the-cpu-ref-is-truth">4.3 <code>test_cpu_cuda_ppl</code> — capture vs check, and why the CPU ref is truth</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">want_write</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* CAPTURE (slow, opt-in): score on a DS4_BACKEND_CPU engine, commit the constant */</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">have_base</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* SKIP: no committed CPU reference → never auto-run the slow capture */</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="cm">/* CHECK (fast): score the same corpus on CUDA, compare to the committed CPU constant */</span>
+<span class="w">    </span><span class="n">TEST_ASSERT</span><span class="p">(</span><span class="n">fabs</span><span class="p">(</span><span class="n">cuda_avg</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">base_avg</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">base_tol</span><span class="p">);</span>
+</code></pre></div>
+
+<p>The CPU-f32 forward is the <strong>ground-truth</strong> scalar — it's build-independent (it doesn't
+change between upstream and our kernels), so it's captured <em>once</em> on the Grace cores
+(slow) and committed as a constant. Routine runs only score the fast CUDA path against
+that constant. If no reference is committed, the gate <strong>skips</strong> — it never silently
+triggers the slow capture. This is the gate that proves <em>CUDA == reference</em>, not merely
+<em>CUDA == itself</em>.</p>
+<hr />
+<h2 id="5-the-numbers-youre-standing-behind">5. The numbers you're standing behind</h2>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>Result</th>
+<th>Tolerance</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tensor-equivalence</td>
+<td>worst_rms <code>0.0052</code>, worst_max <code>0.039</code></td>
+<td><code>0.05</code> / <code>0.5</code></td>
+<td>~10× margin over the measured GB10 float-noise floor; ~40× under the RMS-0.2 regression class</td>
+</tr>
+<tr>
+<td>cuda-ppl</td>
+<td>ppl <code>3.856</code>, Δ <code>0.000000</code></td>
+<td><code>0.03</code></td>
+<td>self-baseline regenerated <strong>on this branch</strong> → bit-exact vs itself</td>
+</tr>
+<tr>
+<td>cpu-cuda-ppl</td>
+<td>CUDA <code>5.816</code> vs CPU-f32 <code>5.824</code>, Δ <code>0.0015</code></td>
+<td><code>0.03</code></td>
+<td>the genuine CUDA-vs-CPU numeric gap, well inside tol</td>
+</tr>
+</tbody>
+</table>
+<p>Three things to internalize so you can defend them:</p>
+<ul>
+<li>
+<p><strong>Why tensor-equivalence isn't 0.</strong> CUDA runs the production decode path (<code>quality=0</code>,
+  i.e. TF32 + WMMA); the CPU reference accumulates in plain f32/f64. TF32 has a 10-bit
+  mantissa on the multiply inputs. ~0.5% relative RMS vs an f32 reference is <em>expected
+  and healthy</em> — it's the hardware's documented precision, not a bug. A real kernel bug
+  shows up as the 0.2-class (≈40×) jump, or as a single layer spiking while its
+  neighbors stay at noise (which is why per-layer localization matters).</p>
+</li>
+<li>
+<p><strong>Why cuda-ppl Δ is exactly 0.000000.</strong> The committed baseline was <em>regenerated on this
+  branch</em> (a review-pass fix — it had been carried over from the <code>land</code> tree, which has
+  different kernels, giving a confusing 0.0079 drift). With <code>NO_ATOMIC_DOWN</code> forcing
+  determinism, the score is bit-reproducible, so a fresh build matches its own committed
+  baseline exactly. If you ever see Δ≠0 here, <em>your kernels changed.</em></p>
+</li>
+<li>
+<p><strong>Why cpu-cuda-ppl Δ is nonzero (and the sign is meaningless).</strong> <code>0.0015</code> avg-NLL is
+  the real TF32/atomic-vs-f32 gap integrated over 398 tokens. CUDA scoring <em>lower</em> than
+  CPU is not "CUDA is better" — it's sub-ulp noise that happened to land that way. Only
+  the <strong>magnitude</strong> matters, and it's 20× under tol. (The two corpora differ — 1185 vs
+  398 tokens, ppl 3.856 vs 5.816 — simply because they're different text; the ref corpus
+  is shorter and denser.)</p>
+</li>
+</ul>
+<hr />
+<h2 id="6-backend-behavior-matrix-so-you-can-answer-does-this-break-my-mac">6. Backend behavior matrix (so you can answer "does this break my Mac?")</h2>
+<table>
+<thead>
+<tr>
+<th>Build</th>
+<th>Registry rows</th>
+<th>Functions</th>
+<th>Selftest</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CUDA (Linux)</strong></td>
+<td>included (<code>#ifndef DS4_NO_GPU</code>)</td>
+<td>run</td>
+<td>runs, asserts</td>
+</tr>
+<tr>
+<td><strong>Metal (macOS)</strong></td>
+<td>included</td>
+<td>run, <strong>print "skipped"</strong> via <code>#ifdef __APPLE__</code> early-return</td>
+<td>never <em>called</em>; <strong>compiles</strong></td>
+</tr>
+<tr>
+<td><strong>CPU (<code>DS4_NO_GPU</code>)</strong></td>
+<td>excluded</td>
+<td>compiled-but-unused (<code>-Wno-unused-function</code>)</td>
+<td><code>#ifdef DS4_NO_GPU</code> → returns 1</td>
+</tr>
+</tbody>
+</table>
+<p>The one subtle claim is "<strong>the selftest compiles on Metal even though it's never called
+there.</strong>" Proof by construction: the in-tree sibling <code>metal_graph_first_token_full_test</code>
+(<code>ds4.c:15913</code>) is <strong>not</strong> behind any <code>DS4_NO_GPU</code>/Apple guard and uses the <em>identical</em>
+symbol set (<code>metal_graph_alloc</code>, <code>materialize_ffn_out</code>, <code>ds4_gpu_embed_token_hc_tensor</code>,
+<code>metal_graph_encode_decode_layer</code>, <code>ds4_gpu_tensor_write/read</code>). If that compiles in the
+Metal TU — and it does, it ships — ours does too. (Still worth one <code>make</code> on a Mac before
+upstreaming, but it's low risk.)</p>
+<hr />
+<h2 id="7-what-changed-across-the-three-review-passes-the-provenance">7. What changed across the three review passes (the provenance)</h2>
+<p>You watched these happen; here they are in one place because a reviewer may ask "why is
+the baseline what it is":</p>
+<ol>
+<li><strong>Baseline cross-tree staleness</strong> → regenerated <code>ppl-baseline.txt</code> on this branch.
+   Δ went <code>0.0079 → 0.000000</code>. (The old value came from the <code>land</code> tree's kernels.)</li>
+<li><strong>Quiet-by-default</strong> → per-layer dump gated behind <code>DS4_TEST_TE_VERBOSE</code>; passing runs
+   print only the summary.</li>
+<li><strong>Env hygiene</strong> → the public selftest now saves/restores <code>DS4_CUDA_MOE_NO_ATOMIC_DOWN</code>
+   instead of leaking it into the rest of an <code>--all</code> run.</li>
+<li><strong>Docs</strong> → the three gates documented under <em>Correctness Regression Tests</em> in
+   <code>CONTRIBUTING.md</code> (where upstream already documents <code>ds4_test</code> flags + <code>cuda-regression</code>).</li>
+</ol>
+<hr />
+<h2 id="8-defend-it-qa-anticipated-antirez-questions">8. Defend-it Q&amp;A (anticipated antirez questions)</h2>
+<ul>
+<li><strong>"Does this touch inference?"</strong> No. <code>git diff --stat upstream/main..HEAD</code> is additive;
+  the only non-test edits are a new function and a header decl. No existing function body
+  changes.</li>
+<li><strong>"Why not just keep token-diff?"</strong> Token-diff <em>masked</em> the RMS-0.2 you caught — it only
+  trips when drift flips a greedy argmax. Per-layer tensor RMS catches sub-argmax drift
+  <em>and localizes it</em>; the CPU cross-check anchors CUDA to f32 truth.</li>
+<li><strong>"Will it pass on my Mac / CI?"</strong> On Metal it registers and <strong>skips</strong> at runtime
+  (<code>#ifdef __APPLE__</code>), so <code>make test</code> stays green; it compiles via the sibling pattern.</li>
+<li><strong>"Why isn't cpu-cuda-ppl exactly 0?"</strong> It's the TF32-vs-f32 gap (<code>0.0015</code>), 20× under
+  tol; the sign is noise.</li>
+<li><strong>"Maintenance cost?"</strong> On an intentional numeric change, regenerate baselines with
+  <code>make cuda-ppl-baseline</code> / <code>make cpu-ppl-baseline</code>. tensor-equivalence needs no
+  baseline file (it recomputes the CPU reference live).</li>
+<li><strong>"Corpus licensing?"</strong> Original synthetic prose+code (a surveyor narrative with an
+  embedded Welford-variance Python snippet), written for this PR — no third-party text.</li>
+</ul>
+<hr />
+<h2 id="9-run-it-where-it-lives">9. Run it / where it lives</h2>
+<div class="codehilite"><pre><span></span><code><span class="c1"># from the branch checkout, with the model available:</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DS4_TEST_MODEL</span><span class="o">=</span>/path/to/ds4flash.gguf
+make<span class="w"> </span>cuda-ppl<span class="w">                          </span><span class="c1"># self-regression (Δ should be ~0 on a clean build)</span>
+make<span class="w"> </span>cpu-cuda-ppl<span class="w">                      </span><span class="c1"># CUDA-vs-CPU-f32 cross-check</span>
+./ds4_test<span class="w"> </span>--cuda-tensor-equivalence<span class="w">   </span><span class="c1"># per-layer RMS gate (quiet summary)</span>
+<span class="nv">DS4_TEST_TE_VERBOSE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./ds4_test<span class="w"> </span>--cuda-tensor-equivalence<span class="w">   </span><span class="c1"># full per-layer dump</span>
+
+<span class="c1"># regenerate baselines after an intentional numeric change:</span>
+make<span class="w"> </span>cuda-ppl-baseline<span class="w">                 </span><span class="c1"># rewrites tests/test-vectors/ppl-baseline.txt</span>
+make<span class="w"> </span>cpu-ppl-baseline<span class="w">                  </span><span class="c1"># rewrites tests/test-vectors/ppl-baseline-cpu.txt (slow, Grace cores)</span>
+</code></pre></div>
+
+<p>Tolerance knobs: <code>DS4_TEST_TE_RMS_TOL</code>, <code>DS4_TEST_TE_MAX_TOL</code> (tensor-equivalence);
+corpus/baseline overrides: <code>DS4_TEST_PPL_CORPUS</code>, <code>DS4_TEST_PPL_BASELINE</code>,
+<code>DS4_TEST_PPL_REF_CORPUS</code>, <code>DS4_TEST_PPL_CPU_BASELINE</code>.</p>
+<p>Branch <code>prep/correctness-gate</code> (<code>8950efb</code>), pushed to <code>origin</code> only — <strong>no upstream PR
+is open</strong>; opening one is your call.</p>
+</main>
+</div>
+</body>
+</html>

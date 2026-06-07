@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# gamut-cli — run the gamut package from anywhere (sets PYTHONPATH to tools/perf).
+#   tools/perf/gamut-cli capture --label x --fast --rebuild
+#   tools/perf/gamut-cli bench --label x --matrix --iter 3 --fast
+#   tools/perf/gamut-cli report /tmp/run_p.sqlite --accept acc.txt
+#   tools/perf/gamut-cli db list | show <ref> | compare <a> <b> | backfill
+here="$(cd "$(dirname "$0")" && pwd)"
+exec env PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" python3 -m gamut "$@"

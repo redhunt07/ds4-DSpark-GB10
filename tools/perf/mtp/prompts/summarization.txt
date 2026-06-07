@@ -1,0 +1,3 @@
+Summarize the following passage in 3-4 sentences, then list its main claims as bullet points:
+
+"The Industrial Revolution, which began in Britain in the late eighteenth century, transformed economies that had been based on agriculture and handicraft into ones dominated by industry and machine manufacturing. New sources of power, especially coal and steam, drove factories and locomotives. Urban populations swelled as people left the countryside for work in mills and factories, often enduring long hours and dangerous conditions. While the period produced enormous gains in productivity and eventually higher living standards, it also created sharp inequalities, environmental degradation, and social upheaval that reformers spent the following century trying to address."

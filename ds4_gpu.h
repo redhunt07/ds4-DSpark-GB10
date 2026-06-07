@@ -31,6 +31,7 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -53,6 +54,11 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+#ifdef DS4_GRAPH_DECODE_BUILD
+int ds4_gpu_graph_capture_begin(void);
+int ds4_gpu_graph_capture_replay(void);
+int ds4_gpu_graph_capture_update_launch(void);
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -262,6 +268,14 @@ int ds4_gpu_matmul_q8_0_f16_out_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Eagerly populate the Q8->f16 dense-weight cache for one weight (alloc+dequant
+ * the prefill path otherwise pays lazily).  `label` must be the weight's real
+ * name so the cache-admission policy selects the same weights as at runtime.
+ * Launches on the default stream; synchronize when the batch is done. */
+int ds4_gpu_prewarm_q8_f16(const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint64_t in_dim,
+                           uint64_t out_dim, const char *label);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -294,6 +308,20 @@ int ds4_gpu_matmul_f16_pair_tensor(
         uint64_t                weight_b_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Fused deterministic verify GEMMs sharing one activation x + in_dim: one grouped
+ * WMMA launch over all slices (GPU-filling), bit-identical to N separate WMMA GEMMs.
+ * out_dims[i] and in_dim must be mult-of-16; n_slices<=8, n_tok<=16. */
+int ds4_gpu_matmul_f16_group_tensor(
+        ds4_gpu_tensor *const  *outs,
+        const void             *model_map,
+        uint64_t                model_size,
+        const uint64_t         *w_offsets,
+        const uint64_t         *out_dims,
+        int                     n_slices,
+        uint64_t                in_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
@@ -433,6 +461,28 @@ int ds4_gpu_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow);
+
+/* Fused per-head RMS norm + RoPE tail rotation on Q-style tensors.
+ * Mathematically equivalent to head_rms_norm_tensor + rope_tail_tensor
+ * applied back-to-back, but in a single kernel — saves one DRAM
+ * round-trip + one launch per call. ULP-scale FMA reordering may differ
+ * from the sequential pair. */
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps);
 
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
@@ -787,7 +837,8 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *dev_token);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,

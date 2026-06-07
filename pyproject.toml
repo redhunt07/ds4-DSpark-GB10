@@ -1,0 +1,14 @@
+[project]
+name = "ds4-python"
+version = "0.1.0"
+description = "Python SDK for the ds4 inference engine (in-process ctypes binding + helpers)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false
+
+[tool.pyright]
+extraPaths = ["python"]

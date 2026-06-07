@@ -1,0 +1,12 @@
+# Tooling config for the MTP fine-tune scripts (ruff + ty via uvx).
+# Not a packaged project — just lint/format/type config for tools/mtp/*.py.
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ty.environment]
+python = ".venv"
+# gguf-py lives in the llama.cpp fork and is added via sys.path at runtime;
+# point ty at it so `import gguf` resolves statically.
+extra-paths = ["/home/trevor/Projects/llama.cpp-tjs-fork/gguf-py"]

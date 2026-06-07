@@ -6,6 +6,7 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/libds4.so
 /ds4flash.gguf
 /TODO.md
 /gguf/
@@ -13,6 +14,17 @@
 *.dSYM/
 __pycache__/
 *.pyc
+/.venv/
 /misc/
 .*.swp
 .DS_Store
+/librechat/
+tools/perf/*/runs/
+/tests/cuda_long_context_smoke
+tools/perf/runs.db
+tools/perf/runs/*/
+tests/test_q4k_dot
+tests/cuda_long_context_smoke
+
+# wandb offline runs (training telemetry, not source)
+wandb/

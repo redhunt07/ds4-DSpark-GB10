@@ -39,6 +39,9 @@ typedef struct {
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
+    const char *mtp_harvest_corpus;
+    const char *mtp_harvest_out;
+    int mtp_harvest_gen;  /* >0: self-distill — greedily generate N tokens/doc */
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -497,6 +500,23 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative_sample(session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       cfg->gen.temperature, 0,
+                                                       cfg->gen.top_p, cfg->gen.min_p, &rng,
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
         } else {
             cli_dist_busy_set(cfg, true);
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
@@ -870,6 +890,166 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* Self-distill harvest: number of top-N target-dist entries kept per generated
+ * position (the LK loss target p). 64 captures the peak; the tail contributes
+ * negligibly to acceptance α = Σ min(p,q). 64*(4+4) = 512 B/position. */
+#define MTP_TOPN 64
+
+/* Write one .pdist record for the base next-token distribution that predicted the
+ * just-generated token (the LK target p[pos]). Renormalize exp(logprob) over the
+ * top-N so it sums to 1. Layout mirrors .mhcd: u32 'MPDT' u32 pos u32 n,
+ * i32 idx[n], f32 val[n]. */
+static void mtp_write_pdist(FILE *pf, uint32_t pos, const ds4_token_score *s, int n) {
+    if (!pf || n <= 0) return;
+    double z = 0.0;
+    for (int i = 0; i < n; i++) z += exp((double)s[i].logprob);
+    if (z <= 0.0) z = 1.0;
+    const uint32_t magic = 0x4D504454u;  /* 'MPDT' */
+    const uint32_t nn = (uint32_t)n;
+    fwrite(&magic, sizeof(magic), 1, pf);
+    fwrite(&pos, sizeof(pos), 1, pf);
+    fwrite(&nn, sizeof(nn), 1, pf);
+    for (int i = 0; i < n; i++) {
+        int32_t id = (int32_t)s[i].id;
+        fwrite(&id, sizeof(id), 1, pf);
+    }
+    for (int i = 0; i < n; i++) {
+        float val = (float)(exp((double)s[i].logprob) / z);
+        fwrite(&val, sizeof(val), 1, pf);
+    }
+}
+
+/* FastMTP data harvest: load the model ONCE, then per corpus doc (fresh session):
+ *  - prefill mode (default): dump per-prefill-position base-HC + the prompt tokens.
+ *  - self-distill mode (--mtp-harvest-gen N): prefill WITHOUT dumping, then greedily
+ *    generate <=N tokens, dumping per generated position the base-HC, the token, and
+ *    the base top-N next-token dist (the LK target p). Trains on the model's own
+ *    generations through its real Q4_K path. HC keyed by absolute pos; packer rebases.
+ * Out dir must exist. Per-doc: <out>/shard_NNNNN.mhcd + .tok (+ .pdist in gen mode). */
+static int run_mtp_harvest(ds4_engine *engine, const cli_config *cfg) {
+    FILE *fp = fopen(cfg->gen.mtp_harvest_corpus, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot open corpus %s\n", cfg->gen.mtp_harvest_corpus);
+        return 1;
+    }
+    /* In prefill mode the doc IS the training text (need enough positions); in
+     * gen mode the doc is just a seed PROMPT, so allow short ones. */
+    const int MIN_TOK = cfg->gen.mtp_harvest_gen > 0 ? 4 : 16, MAX_TOK = 512;
+    /* Docs are NUL-separated (not one-per-line) so multi-line content — code,
+     * lists, multi-paragraph chat — survives intact (critical for the
+     * structured-list/code/essay classes we target). */
+    /* Pre-count NUL-separated docs for a progress denominator (cheap byte scan). */
+    long n_docs = 0;
+    { int c; while ((c = fgetc(fp)) != EOF) if (c == '\0') n_docs++; rewind(fp); }
+    /* The per-doc session create spams comp-KV/prefill/prewarm lines; silence them. */
+    ds4_set_quiet_logs(1);
+    char *line = NULL; size_t cap = 0;
+    char err[256];
+    int k = 0, kept = 0; long total_pos = 0;
+    double gen_sec = 0.0;  /* decode-only wall time (gen mode) for rate sizing */
+    while (getdelim(&line, &cap, '\0', fp) != -1) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r' ||
+                         line[L - 1] == ' ' || line[L - 1] == '\t'))
+            line[--L] = 0;
+        if (L < 2) { k++; continue; }
+        ds4_tokens toks = {0};
+        /* Self-distill (gen) must WRAP the prompt in the chat template
+         * (BOS <｜User｜> prompt <｜Assistant｜> </think>) so the base produces an
+         * ASSISTANT response, matching the deploy path (ds4_agent). Raw tokenization
+         * makes the base document-continue the prompt (dataset/JSON artifacts) — a
+         * train/deploy mismatch. DS4_THINK_NONE matches the A/B's --nothink. Fixed-
+         * data mode teacher-forces raw corpus text, so it stays unwrapped. */
+        if (cfg->gen.mtp_harvest_gen > 0)
+            ds4_encode_chat_prompt(engine, NULL, line, DS4_THINK_NONE, &toks);
+        else
+            ds4_tokenize_text(engine, line, &toks);
+        if (toks.len < MIN_TOK || toks.len > MAX_TOK) { ds4_tokens_free(&toks); k++; continue; }
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+            ds4_tokens_free(&toks); k++; continue;
+        }
+        char base[1024];
+        snprintf(base, sizeof(base), "%s/shard_%05d.mhcd", cfg->gen.mtp_harvest_out, k);
+        int rc;
+        long doc_pos;
+        if (cfg->gen.mtp_harvest_gen > 0) {
+            /* Self-distill: prefill WITHOUT dumping (arm AFTER sync) so only the
+             * model's own generations land in the shard, then greedily generate,
+             * capturing per generated position: base HC (decode dump), the token,
+             * and the base top-N next-token dist (LK target p, BEFORE eval = the
+             * dist that produced the token). HC keyed by absolute pos -> the packer
+             * rebases to 0 and aligns with the gen-only .tok and .pdist. */
+            rc = ds4_session_sync(session, &toks, err, sizeof(err));
+            doc_pos = 0;
+            if (rc == 0) {
+                ds4_mtp_dump_begin(base);
+                char pdist_path[1216];
+                snprintf(pdist_path, sizeof(pdist_path), "%s.pdist", base);
+                FILE *pf = fopen(pdist_path, "wb");
+                ds4_token_score *scores = calloc((size_t)MTP_TOPN, sizeof(scores[0]));
+                ds4_tokens gen = {0};
+                int budget = cfg->gen.mtp_harvest_gen;
+                int room = ds4_session_ctx(session) - ds4_session_pos(session) - 1;
+                if (budget > room) budget = room;
+                const double t_gen0 = cli_now_sec();
+                for (int g = 0; g < budget; g++) {
+                    int tok = ds4_session_argmax(session);
+                    if (tok == ds4_token_eos(engine)) break;
+                    if (pf && scores)
+                        mtp_write_pdist(pf, (uint32_t)g, scores,
+                                        ds4_session_top_logprobs(session, scores,
+                                                                 MTP_TOPN));
+                    if (ds4_session_eval(session, tok, err, sizeof(err)) != 0) break;
+                    ds4_tokens_push(&gen, tok);
+                    doc_pos++;
+                }
+                gen_sec += cli_now_sec() - t_gen0;
+                free(scores);
+                if (pf) fclose(pf);
+                ds4_mtp_dump_end();
+                char tok_path[1216];
+                snprintf(tok_path, sizeof(tok_path), "%s.tok", base);
+                FILE *tf = fopen(tok_path, "wb");
+                if (tf) {
+                    int32_t nn = (int32_t)gen.len;
+                    fwrite(&nn, sizeof(nn), 1, tf);
+                    for (int j = 0; j < gen.len; j++) {
+                        int32_t t = (int32_t)gen.v[j];
+                        fwrite(&t, sizeof(t), 1, tf);
+                    }
+                    fclose(tf);
+                }
+                ds4_tokens_free(&gen);
+            }
+        } else {
+            ds4_mtp_dump_begin(base);
+            rc = ds4_session_sync(session, &toks, err, sizeof(err));
+            ds4_mtp_dump_end();
+            doc_pos = toks.len;
+        }
+        ds4_session_free(session);
+        if (rc == 0) { kept++; total_pos += doc_pos; }
+        else fprintf(stderr, "\nds4: harvest doc %d sync failed: %s\n", k, err);
+        ds4_tokens_free(&toks);
+        k++;
+        fprintf(stderr, "\r[harvest] %d/%ld docs · %d kept · %ld positions   ",
+                k, n_docs, kept, total_pos);
+    }
+    free(line);
+    fclose(fp);
+    fprintf(stderr, "\nds4: mtp-harvest done: %d/%d docs, %ld positions -> %s\n",
+            kept, k, total_pos, cfg->gen.mtp_harvest_out);
+    if (gen_sec > 0.0)
+        /* Decode-only rate (excludes model load + per-doc prefill) for sizing the
+         * full harvest: tokens / hours = positions achievable per wall hour. */
+        fprintf(stderr,
+                "ds4: decode rate %.1f tok/s (%ld tokens in %.0fs) -> ~%.0fk pos/hour\n",
+                total_pos / gen_sec, total_pos, gen_sec,
+                total_pos / gen_sec * 3600.0 / 1000.0);
+    return 0;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1167,6 +1347,22 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative_sample(chat->session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       cfg->gen.temperature, 0,
+                                                       cfg->gen.top_p, cfg->gen.min_p, &rng,
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
         } else {
             cli_dist_busy_set(cfg, true);
             int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
@@ -1394,7 +1590,7 @@ static cli_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
+            .mtp_draft_tokens = 2,
             .mtp_margin = 3.0f,
         },
         .gen = {
@@ -1553,6 +1749,11 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--perplexity-file")) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-harvest")) {
+            c.gen.mtp_harvest_corpus = need_arg(&i, argc, argv, arg);
+            c.gen.mtp_harvest_out = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-harvest-gen")) {
+            c.gen.mtp_harvest_gen = atoi(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
@@ -1693,6 +1894,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.mtp_harvest_corpus) {
+        rc = run_mtp_harvest(engine, &cfg);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

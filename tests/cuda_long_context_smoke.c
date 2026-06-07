@@ -115,9 +115,15 @@ static int check_decode_attention_overflow_path(void) {
         ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
         ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
         ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        /* The API used to take (sinks_ptr, sinks_size); it now takes
+         * (model_map, model_size, sinks_offset) so sinks can live at a
+         * fixed offset inside the mmap'd model file.  For this smoke
+         * test we treat the bare `sinks` heap allocation as a one-buffer
+         * "model" with sinks at offset 0.  Also added since the old
+         * signature: comp_kv_f16 (0 here because comp_host is f32). */
         ds4_gpu_attention_decode_heads_tensor(heads,
-                                              sinks,
-                                              n_head * sizeof(float),
+                                              (const void *)sinks,
+                                              (uint64_t)n_head * sizeof(float),
                                               0,
                                               q,
                                               raw,

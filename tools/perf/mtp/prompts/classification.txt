@@ -1,0 +1,8 @@
+Classify each of the following customer reviews as Positive, Negative, or Neutral, and give a one-line justification for each. Then summarize the overall sentiment.
+
+1. "Shipping was lightning fast, but the product broke after just two days."
+2. "Absolutely love it — works perfectly and looks great on my desk."
+3. "It's fine. Does the job, nothing special, nothing wrong."
+4. "Terrible customer support. Waited a week for a reply. Never buying again."
+5. "Exactly as described. Arrived on time. No complaints."
+6. "The app keeps crashing but when it works it's actually pretty useful."

@@ -1,0 +1,11 @@
+.venv/
+corpus_pol.txt
+*.pt
+ckpt/
+ckpt_*/
+__pycache__/
+wandb/
+prompts_sd.txt
+prompts_sd.txt.classes.json
+prompts_v2.txt
+prompts_v2.txt.classes.json

@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="380" font-family="sans-serif">
+<rect width="620" height="380" fill="white"/>
+<text x="310.0" y="22" font-size="16" font-weight="bold" text-anchor="middle">MTP decode (t/s) vs context</text>
+<line x1="60" y1="335" x2="600" y2="335" stroke="#eee"/>
+<text x="54" y="339" font-size="10" text-anchor="end" fill="#666">0</text>
+<line x1="60" y1="276" x2="600" y2="276" stroke="#eee"/>
+<text x="54" y="280" font-size="10" text-anchor="end" fill="#666">4</text>
+<line x1="60" y1="217" x2="600" y2="217" stroke="#eee"/>
+<text x="54" y="221" font-size="10" text-anchor="end" fill="#666">8</text>
+<line x1="60" y1="158" x2="600" y2="158" stroke="#eee"/>
+<text x="54" y="162" font-size="10" text-anchor="end" fill="#666">12</text>
+<line x1="60" y1="99" x2="600" y2="99" stroke="#eee"/>
+<text x="54" y="103" font-size="10" text-anchor="end" fill="#666">16</text>
+<line x1="60" y1="40" x2="600" y2="40" stroke="#eee"/>
+<text x="54" y="44" font-size="10" text-anchor="end" fill="#666">20</text>
+<text x="60" y="350" font-size="10" text-anchor="middle" fill="#666">0k</text>
+<text x="224" y="350" font-size="10" text-anchor="middle" fill="#666">20k</text>
+<text x="387" y="350" font-size="10" text-anchor="middle" fill="#666">40k</text>
+<text x="551" y="350" font-size="10" text-anchor="middle" fill="#666">60k</text>
+<text x="310.0" y="374" font-size="11" text-anchor="middle" fill="#444">context size</text>
+<polyline points="76.8,125.6 93.5,119.4 110.3,56.5 127.0,109.6 143.8,87.1 160.5,112.4 177.3,102.1 194.1,117.7 210.8,114.2 227.6,98.6 244.3,111.4 261.1,120.8 277.8,97.5 294.6,118.2 311.3,114.5 328.1,121.0 344.9,116.1 361.6,135.0 378.4,131.4 395.1,126.9 411.9,127.6 428.6,142.4 445.4,134.0 462.2,119.1 478.9,142.5 495.7,141.6 512.4,142.2 529.2,140.3 545.9,145.0 562.7,145.9 579.4,148.4 596.2,141.5" fill="none" stroke="#2c7fb8" stroke-width="2.5"/>
+<circle cx="76.8" cy="125.6" r="2.5" fill="#2c7fb8"/>
+<circle cx="93.5" cy="119.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="110.3" cy="56.5" r="2.5" fill="#2c7fb8"/>
+<circle cx="127.0" cy="109.6" r="2.5" fill="#2c7fb8"/>
+<circle cx="143.8" cy="87.1" r="2.5" fill="#2c7fb8"/>
+<circle cx="160.5" cy="112.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="177.3" cy="102.1" r="2.5" fill="#2c7fb8"/>
+<circle cx="194.1" cy="117.7" r="2.5" fill="#2c7fb8"/>
+<circle cx="210.8" cy="114.2" r="2.5" fill="#2c7fb8"/>
+<circle cx="227.6" cy="98.6" r="2.5" fill="#2c7fb8"/>
+<circle cx="244.3" cy="111.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="261.1" cy="120.8" r="2.5" fill="#2c7fb8"/>
+<circle cx="277.8" cy="97.5" r="2.5" fill="#2c7fb8"/>
+<circle cx="294.6" cy="118.2" r="2.5" fill="#2c7fb8"/>
+<circle cx="311.3" cy="114.5" r="2.5" fill="#2c7fb8"/>
+<circle cx="328.1" cy="121.0" r="2.5" fill="#2c7fb8"/>
+<circle cx="344.9" cy="116.1" r="2.5" fill="#2c7fb8"/>
+<circle cx="361.6" cy="135.0" r="2.5" fill="#2c7fb8"/>
+<circle cx="378.4" cy="131.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="395.1" cy="126.9" r="2.5" fill="#2c7fb8"/>
+<circle cx="411.9" cy="127.6" r="2.5" fill="#2c7fb8"/>
+<circle cx="428.6" cy="142.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="445.4" cy="134.0" r="2.5" fill="#2c7fb8"/>
+<circle cx="462.2" cy="119.1" r="2.5" fill="#2c7fb8"/>
+<circle cx="478.9" cy="142.5" r="2.5" fill="#2c7fb8"/>
+<circle cx="495.7" cy="141.6" r="2.5" fill="#2c7fb8"/>
+<circle cx="512.4" cy="142.2" r="2.5" fill="#2c7fb8"/>
+<circle cx="529.2" cy="140.3" r="2.5" fill="#2c7fb8"/>
+<circle cx="545.9" cy="145.0" r="2.5" fill="#2c7fb8"/>
+<circle cx="562.7" cy="145.9" r="2.5" fill="#2c7fb8"/>
+<circle cx="579.4" cy="148.4" r="2.5" fill="#2c7fb8"/>
+<circle cx="596.2" cy="141.5" r="2.5" fill="#2c7fb8"/>
+<rect x="490" y="39" width="12" height="12" fill="#2c7fb8"/><text x="506" y="49" font-size="11">PR3</text>
+<polyline points="76.8,87.6 93.5,117.7 110.3,50.0 127.0,116.3 143.8,81.3 160.5,112.3 177.3,85.4 194.1,112.6 210.8,99.9 227.6,66.8 244.3,109.6 261.1,111.1 277.8,105.8 294.6,100.5 311.3,105.0 328.1,107.4 344.9,114.9 361.6,133.7 378.4,136.5 395.1,115.8 411.9,143.5 428.6,141.0 445.4,137.5 462.2,137.8 478.9,146.2 495.7,146.2 512.4,143.0 529.2,130.0 545.9,141.5 562.7,152.4 579.4,147.2 596.2,144.9" fill="none" stroke="#c0392b" stroke-width="2.5"/>
+<circle cx="76.8" cy="87.6" r="2.5" fill="#c0392b"/>
+<circle cx="93.5" cy="117.7" r="2.5" fill="#c0392b"/>
+<circle cx="110.3" cy="50.0" r="2.5" fill="#c0392b"/>
+<circle cx="127.0" cy="116.3" r="2.5" fill="#c0392b"/>
+<circle cx="143.8" cy="81.3" r="2.5" fill="#c0392b"/>
+<circle cx="160.5" cy="112.3" r="2.5" fill="#c0392b"/>
+<circle cx="177.3" cy="85.4" r="2.5" fill="#c0392b"/>
+<circle cx="194.1" cy="112.6" r="2.5" fill="#c0392b"/>
+<circle cx="210.8" cy="99.9" r="2.5" fill="#c0392b"/>
+<circle cx="227.6" cy="66.8" r="2.5" fill="#c0392b"/>
+<circle cx="244.3" cy="109.6" r="2.5" fill="#c0392b"/>
+<circle cx="261.1" cy="111.1" r="2.5" fill="#c0392b"/>
+<circle cx="277.8" cy="105.8" r="2.5" fill="#c0392b"/>
+<circle cx="294.6" cy="100.5" r="2.5" fill="#c0392b"/>
+<circle cx="311.3" cy="105.0" r="2.5" fill="#c0392b"/>
+<circle cx="328.1" cy="107.4" r="2.5" fill="#c0392b"/>
+<circle cx="344.9" cy="114.9" r="2.5" fill="#c0392b"/>
+<circle cx="361.6" cy="133.7" r="2.5" fill="#c0392b"/>
+<circle cx="378.4" cy="136.5" r="2.5" fill="#c0392b"/>
+<circle cx="395.1" cy="115.8" r="2.5" fill="#c0392b"/>
+<circle cx="411.9" cy="143.5" r="2.5" fill="#c0392b"/>
+<circle cx="428.6" cy="141.0" r="2.5" fill="#c0392b"/>
+<circle cx="445.4" cy="137.5" r="2.5" fill="#c0392b"/>
+<circle cx="462.2" cy="137.8" r="2.5" fill="#c0392b"/>
+<circle cx="478.9" cy="146.2" r="2.5" fill="#c0392b"/>
+<circle cx="495.7" cy="146.2" r="2.5" fill="#c0392b"/>
+<circle cx="512.4" cy="143.0" r="2.5" fill="#c0392b"/>
+<circle cx="529.2" cy="130.0" r="2.5" fill="#c0392b"/>
+<circle cx="545.9" cy="141.5" r="2.5" fill="#c0392b"/>
+<circle cx="562.7" cy="152.4" r="2.5" fill="#c0392b"/>
+<circle cx="579.4" cy="147.2" r="2.5" fill="#c0392b"/>
+<circle cx="596.2" cy="144.9" r="2.5" fill="#c0392b"/>
+<rect x="490" y="57" width="12" height="12" fill="#c0392b"/><text x="506" y="67" font-size="11">current</text>
+</svg>
