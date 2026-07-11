@@ -148,7 +148,9 @@ env DS4_CUDA_FAST_VERIFY=1 \
   --temp 0 --nothink
 ```
 
-`FAST_VERIFY` accelera attention batched, GEMM e ordinamento delle righe.
+`FAST_VERIFY` accelera GEMM e ordinamento delle righe; il profilo raccomandato
+disabilita il ramo attention `heads8` non canonico per evitare deriva dei logit
+a contesto lungo.
 È self-consistent e adatto al lavoro quotidiano, ma il programma segnala che
 può produrre una sequenza greedy diversa dal target deterministico canonico.
 Su contesti lunghi il servizio disabilita inoltre `heads8`, il ramo di
@@ -212,8 +214,10 @@ Su una cronologia agent coding arrivata a circa 48k token:
 | GPU memory | ~27.6 GiB |
 | Temperatura | ~74 °C |
 
-Il calo rispetto a 18.11 tok/s è atteso: l’attenzione KV cresce con il contesto
-reale e il risultato isolato non rappresenta ogni posizione da 48k/131k.
+Su un prompt da 30.478 token il profilo corretto ha prodotto 15.29 tok/s medi,
+output coerente, stop normale e zero token BOS ripetuti. Il calo rispetto a
+18.11 tok/s è atteso: l’attenzione KV cresce con il contesto reale e il
+risultato isolato non rappresenta ogni posizione da 48k/131k.
 
 ### Matrice storica GB10
 
