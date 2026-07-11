@@ -35,7 +35,7 @@ ExecStart=/home/redhunt07/ai-stack/ds4-gb10-dspark/ds4-server \
   --port 8000 \
   --cors \
   --warm-weights \
-  --power 100 \
+  --power 85 \
   --kv-disk-dir /home/redhunt07/ai-stack/ds4-gb10-dspark/kv-cache \
   --kv-disk-space-mb 98304 \
   --kv-cache-min-tokens 512 \

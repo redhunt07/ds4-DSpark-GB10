@@ -290,7 +290,10 @@ systemctl status ds4-server.service
 ```
 
 Il servizio usa il GGUF DSpark corretto, `--dspark`, `ctx=131072`, chunk 2048,
-fast verify, MoE deterministico e KV disk cache. Log:
+fast verify, MoE deterministico, `--power 85` e KV disk cache. `--power 85`
+riduce il rischio di throttling termico sostenuto sul GB10 e può mantenere un
+throughput più stabile rispetto a `--power 100`. È il valore consigliato per
+sessioni Pi Code lunghe. Log:
 
 ```sh
 journalctl -u ds4-server.service -f
