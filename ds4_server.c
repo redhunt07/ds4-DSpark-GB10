@@ -10565,7 +10565,8 @@ decode_again:
             temperature = 0.0f;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_eos(s->engine)) {
+        if (token == ds4_token_bos(s->engine) ||
+            token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
         }
@@ -10582,7 +10583,8 @@ decode_again:
         int ntok = 0;
         if (temperature <= 0.0f &&
             ds4_engine_spec_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+            getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
@@ -10598,7 +10600,8 @@ decode_again:
             }
         } else if (temperature > 0.0f &&
                    ds4_engine_spec_draft_tokens(s->engine) > 1 &&
-                   getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+                   getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_sample(s->session,
                                                        token,
@@ -10625,7 +10628,8 @@ decode_again:
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
+            if (token == ds4_token_bos(s->engine) ||
+                token == ds4_token_eos(s->engine)) {
                 finish = "stop";
                 stop_decode = true;
                 break;

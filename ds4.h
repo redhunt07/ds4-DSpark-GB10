@@ -286,6 +286,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
+int ds4_token_bos(ds4_engine *e);
 int ds4_token_eos(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);

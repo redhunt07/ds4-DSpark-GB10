@@ -24358,6 +24358,10 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     return out;
 }
 
+int ds4_token_bos(ds4_engine *e) {
+    return e->vocab.bos_id;
+}
+
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
 }
