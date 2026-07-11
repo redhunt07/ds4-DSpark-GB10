@@ -9,6 +9,7 @@ shift || true
 exec env \
   DS4_CUDA_FAST_VERIFY=1 \
   DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 \
+  DS4_CUDA_NO_INDEXED_HEADS8=1 \
   "$repo_dir/ds4" --cuda \
   --model "$model" --dspark \
   --ctx 131072 --tokens 32768 -t 10 \

@@ -141,6 +141,7 @@ env DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 \
 ```sh
 env DS4_CUDA_FAST_VERIFY=1 \
     DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 \
+    DS4_CUDA_NO_INDEXED_HEADS8=1 \
     DS4_GRAPH_DECODE=1 \
   ./ds4 --cuda --model "$MODEL" --dspark \
   --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 2048 \
@@ -150,6 +151,9 @@ env DS4_CUDA_FAST_VERIFY=1 \
 `FAST_VERIFY` accelera attention batched, GEMM e ordinamento delle righe.
 È self-consistent e adatto al lavoro quotidiano, ma il programma segnala che
 può produrre una sequenza greedy diversa dal target deterministico canonico.
+Su contesti lunghi il servizio disabilita inoltre `heads8`, il ramo di
+attention con ordine di riduzione diverso che può amplificare la deriva dei
+logit; restano attive le ottimizzazioni GEMM del fast verify.
 
 ### Parametri da evitare nel benchmark
 
@@ -324,6 +328,7 @@ Variabili utili:
 | Variabile | Uso |
 |---|---|
 | `DS4_CUDA_FAST_VERIFY=1` | Verifier CUDA veloce; throughput, possibile differenza greedy |
+| `DS4_CUDA_NO_INDEXED_HEADS8=1` | Disabilita il ramo attention heads8 non canonico; consigliato a contesto lungo |
 | `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1` | Riduzione MoE deterministica |
 | `DS4_GRAPH_DECODE=1` | CUDA graph decode |
 | `DS4_DSPARK_TIMING=1` | Tempi per iterazione DSpark |

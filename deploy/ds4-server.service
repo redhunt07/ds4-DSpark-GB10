@@ -15,6 +15,7 @@ Environment=DS4_THREADS=10
 Environment=DS4_GRAPH_DECODE=1
 Environment=DS4_CUDA_FAST_VERIFY=1
 Environment=DS4_CUDA_MOE_NO_ATOMIC_DOWN=1
+Environment=DS4_CUDA_NO_INDEXED_HEADS8=1
 
 MemoryHigh=118G
 TasksMax=80
