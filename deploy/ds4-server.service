@@ -1,0 +1,56 @@
+[Unit]
+Description=DS4 DSpark GB10 Server
+Documentation=https://github.com/redhunt07/ds4-DSpark-GB10
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=redhunt07
+Group=redhunt07
+WorkingDirectory=/home/redhunt07/ai-stack/ds4-gb10-dspark
+
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=DS4_THREADS=10
+Environment=DS4_GRAPH_DECODE=1
+Environment=DS4_CUDA_FAST_VERIFY=1
+Environment=DS4_CUDA_MOE_NO_ATOMIC_DOWN=1
+
+MemoryHigh=118G
+TasksMax=80
+LimitNOFILE=1048576
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+ExecStart=/home/redhunt07/ai-stack/ds4-gb10-dspark/ds4-server \
+  --model /home/redhunt07/ai-stack/ds4-gb10-dspark/gguf/DeepSeek-V4-Flash-DSpark-Abliterated-COMBINED-Q2.correct.gguf \
+  --cuda \
+  --dspark \
+  --ctx 131072 \
+  --tokens 32768 \
+  -t 10 \
+  --prefill-chunk 2048 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --cors \
+  --warm-weights \
+  --power 100 \
+  --kv-disk-dir /home/redhunt07/ai-stack/ds4-gb10-dspark/kv-cache \
+  --kv-disk-space-mb 98304 \
+  --kv-cache-min-tokens 512 \
+  --kv-cache-cold-max-tokens 60000 \
+  --kv-cache-continued-interval-tokens 8192 \
+  --kv-cache-boundary-trim-tokens 32 \
+  --kv-cache-boundary-align-tokens 2048 \
+  --tool-memory-max-ids 250000
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ds4-dspark-gb10
+
+[Install]
+WantedBy=multi-user.target
