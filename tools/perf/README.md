@@ -54,6 +54,22 @@ DS4_MTP_TIMING=1 ./ds4 $ARGS >/tmp/accept_run.txt 2>&1
 `nsys stats`/`gamut` auto-export the `.nsys-rep` to `.sqlite` on first use; or
 pass an already-exported `.sqlite`.
 
+## Streaming TTFT / throughput diagnostic
+
+For the OpenAI-compatible server, use the helper below to measure client TTFT,
+prompt timing from `ds4-server` logs, and a basic GPU/RAM/KV snapshot:
+
+```sh
+python3 tools/perf/gb10_stream_diag.py \
+  --warmup \
+  --prompt "Rispondi con 128 parole ciao separate da spazi e senza punteggiatura." \
+  --max-tokens 128 \
+  --json /tmp/ds4-stream-diag.json
+```
+
+It prints a Markdown summary plus a log tail and a quick readout telling you
+whether DSpark's speculative timing path was observed.
+
 ## Run the report
 
 ```

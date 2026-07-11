@@ -165,15 +165,18 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
-    opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
+    opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed at 3072; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
+    opt(fp, c, "--dspark [FILE]", "Enable DSpark. Without FILE, use DSpark tensors embedded in --model; FILE keeps compatibility with split support GGUFs.");
     if (full) {
         opt(fp, c, "--mtp FILE", "Optional MTP support GGUF for speculative combined-forward decode.");
         if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-draft N", "Draft tokens per spec iter; needs N>=2 for combined-forward. Default: 2");
+            opt(fp, c, "--dspark-draft N", "Draft tokens per DSpark iter; needs N>=2 for combined-forward. Default: 2");
         } else if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
+            opt(fp, c, "--dspark-draft N", "Maximum autoregressive DSpark draft tokens. Default: 2; DS4_DSPARK_ADAPTIVE=1 stages 2→3→block_size on successful commits (logs stage selection).");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
@@ -318,10 +321,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
-    para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
+    para(fp, c, "DeepSeek-compatible chat requests default to direct answers unless thinking is explicitly enabled.");
+    para(fp, c, "reasoning_effort=high, reasoning_effort=xhigh, or output_config.effort=max requests thinking.");
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
-    para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
+    para(fp, c, "thinking={type:disabled}, think=false, reasoning_effort=low, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
     fputc('\n', fp);
 }
@@ -383,7 +386,7 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
 static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
-    if (streq(topic, "runtime") || streq(topic, "distributed")) return true;
+    if (streq(topic, "runtime") || streq(topic, "distributed") || streq(topic, "dspark")) return true;
     if (streq(topic, "sampling"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
@@ -418,6 +421,7 @@ static void more_line(FILE *fp, const help_colors *c, const char *label, const c
 static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     title(fp, c, "More Info");
     more_line(fp, c, "Runtime full info:", "runtime");
+    more_line(fp, c, "DSpark full info:", "dspark");
     if (tool_has_topic(tool, "sampling"))
         more_line(fp, c, "Sampling full info:", "sampling");
     more_line(fp, c, "Distributed inference:", "distributed");
@@ -447,6 +451,9 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     if (topic_is(topic, "distributed")) {
         opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
         opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
+    } else if (topic_is(topic, "dspark")) {
+        opt(fp, c, "inspect", "./ds4 --inspect -m ds4flash-dspark.gguf --dspark");
+        opt(fp, c, "serve", "./ds4-server -m ds4flash-dspark.gguf --dspark --host 0.0.0.0 --port 8000");
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");
@@ -511,6 +518,13 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     }
 
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
+    else if (streq(topic, "dspark")) {
+        title(fp, c, "DSpark");
+        para(fp, c, "DSpark is the explicit speculative-drafting carrier for DeepSeek V4 Flash/Pro DSpark checkpoints.");
+        para(fp, c, "Load complete DSpark GGUFs with --dspark and no FILE; ds4 validates embedded DSpark metadata and exposes the DSpark identity in logs and summaries.");
+        para(fp, c, "The loader distinguishes DSpark from legacy MTP carriers and rejects mismatched backend/metadata combinations.");
+        fputc('\n', fp);
+    }
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c, tool);
     else if (streq(topic, "distributed")) print_distributed(fp, c);

@@ -1,6 +1,49 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_dspark_runtime.h"
+
+static void test_dspark_runtime_group(void) {
+    ds4_dspark_config cfg;
+    ds4_dspark_config_init_defaults(&cfg);
+    TEST_ASSERT(cfg.n_mtp_layers == 3);
+    TEST_ASSERT(cfg.block_size == 5);
+    TEST_ASSERT(cfg.noise_token_id == 128799u);
+    TEST_ASSERT(cfg.markov_rank == 256);
+    TEST_ASSERT(cfg.target_layer_ids[0] == 40);
+    TEST_ASSERT(cfg.target_layer_ids[1] == 41);
+    TEST_ASSERT(cfg.target_layer_ids[2] == 42);
+
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(true, false, false) == DS4_MTP_DRAFT_LEGACY);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(false, true, true) == DS4_MTP_DRAFT_DSPARK);
+    TEST_ASSERT(ds4_mtp_draft_kind_guess(false, true, false) == DS4_MTP_DRAFT_NONE);
+
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(1, 3) == 0);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(2, 3) == 1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_for_accept(0, 3) == -1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_LEGACY, 5, 8) == 1);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK, 5, 8) == 4);
+    TEST_ASSERT(ds4_dspark_prefix_slot_count(DS4_MTP_DRAFT_DSPARK_NONSEQ, 2, 1) == 1);
+
+    const float high_confidence[5] = {4.0f, 4.0f, 4.0f, 4.0f, 4.0f};
+    const float mixed_confidence[5] = {4.0f, 4.0f, -4.0f, 4.0f, 4.0f};
+    const float low_first[5] = {-4.0f, 4.0f, 4.0f, 4.0f, 4.0f};
+    TEST_ASSERT(ds4_dspark_confidence_schedule_prefix(high_confidence, 5, 5, 0.50f, 0.0f) == 5);
+    TEST_ASSERT(ds4_dspark_confidence_schedule_prefix(high_confidence, 5, 3, 0.50f, 0.0f) == 3);
+    TEST_ASSERT(ds4_dspark_confidence_schedule_prefix(mixed_confidence, 5, 5, 0.50f, 0.0f) == 2);
+    TEST_ASSERT(ds4_dspark_confidence_schedule_prefix(low_first, 5, 5, 0.50f, 0.0f) == 0);
+    TEST_ASSERT(ds4_dspark_confidence_schedule_prefix(high_confidence, 5, 5, 0.50f, 1.0f) == 5);
+
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, true, 2) ==
+                DS4_DSPARK_SPEC_DSPARK_ENABLED);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_LEGACY, true, 2) ==
+                DS4_DSPARK_SPEC_LEGACY_MTP);
+    TEST_ASSERT(ds4_dspark_speculative_gate(DS4_MTP_DRAFT_DSPARK, false, 2) ==
+                DS4_DSPARK_SPEC_DISABLED);
+    TEST_ASSERT(strcmp(ds4_dspark_spec_gate_reason(DS4_DSPARK_SPEC_DSPARK_ENABLED),
+                       "DSpark block speculative decode enabled") == 0);
+}
+
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -2618,6 +2661,10 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_dspark_runtime_group_wrapper(void) {
+    test_dspark_runtime_group();
+}
+
 static void test_spec_sampling_group(void) {
     test_failures += ds4_spec_sampling_selftest();
 }
@@ -2650,6 +2697,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-correctness", "mtp-correctness", "CUDA MTP combined vs exact verify logit-RMS gate (skips on Metal)", test_mtp_correctness},
     {"--mtp-selfconsistency", "mtp-selfconsistency", "CUDA MTP combined verify run-to-run determinism (twice-run bit-diff)", test_mtp_selfconsistency},
 #endif
+    {"--dspark-runtime", "dspark-runtime", "DSpark runtime helper regression", test_dspark_runtime_group_wrapper},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--spec-sampling", "spec-sampling", "speculative-sampling math exactness (host-only, no model)", test_spec_sampling_group},
 };

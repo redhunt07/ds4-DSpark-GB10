@@ -111,6 +111,11 @@ static char *xstrndup(const char *s, size_t n) {
     return p;
 }
 
+static bool env_flag_on(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
 static void buf_reserve(buf *b, size_t add) {
     if (add > SIZE_MAX - b->len - 1) die("buffer overflow");
     size_t need = b->len + add + 1;
@@ -818,7 +823,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
-    r->think_mode = DS4_THINK_HIGH;
+    r->think_mode = DS4_THINK_NONE;
 }
 
 static void request_free(request *r) {
@@ -850,14 +855,12 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
         *out = DS4_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
+        *out = DS4_THINK_NONE;
         return true;
     }
     if (!strcmp(s, "none")) {
@@ -2691,8 +2694,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = false;
+    ds4_think_mode reasoning_effort = DS4_THINK_NONE;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -2870,8 +2873,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = false;
+    ds4_think_mode reasoning_effort = DS4_THINK_NONE;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -3767,8 +3770,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = false;
+    ds4_think_mode reasoning_effort = DS4_THINK_NONE;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -4067,8 +4070,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    bool thinking_enabled = false;
+    ds4_think_mode reasoning_effort = DS4_THINK_NONE;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -10566,11 +10569,19 @@ decode_again:
             finish = "stop";
             break;
         }
+        if (temperature <= 0.0f && env_flag_on("DS4_DSPARK_TIMING")) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: spec gate ctx=%s has_dspark=%s spec_draft=%d temp=%.2f",
+                       ctx_span,
+                       ds4_engine_has_dspark(s->engine) ? "true" : "false",
+                       ds4_engine_spec_draft_tokens(s->engine),
+                       (double)temperature);
+        }
 
         int toks[17];
         int ntok = 0;
         if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            ds4_engine_spec_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
@@ -10586,7 +10597,7 @@ decode_again:
                 break;
             }
         } else if (temperature > 0.0f &&
-                   ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                   ds4_engine_spec_draft_tokens(s->engine) > 1 &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_sample(s->session,
@@ -11891,8 +11902,13 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.engine.dspark_path = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                                   argv[++i] : DS4_DSPARK_SAME_MODEL;
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            c.engine.dspark_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -13341,7 +13357,7 @@ static void test_streaming_holds_partial_utf8(void) {
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(r.think_mode == DS4_THINK_NONE);
     TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
@@ -13351,8 +13367,8 @@ static void test_request_defaults_use_min_p_filtering(void) {
 
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_NONE);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_NONE);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);

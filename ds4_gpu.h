@@ -53,6 +53,7 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+int ds4_gpu_end_commands_async(void);
 int ds4_gpu_synchronize(void);
 #ifdef DS4_GRAPH_DECODE_BUILD
 int ds4_gpu_graph_capture_begin(void);
@@ -212,6 +213,43 @@ int ds4_gpu_argmax_tensor(
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
 
+int ds4_gpu_dspark_markov_argmax_confidence_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_confidence,
+        ds4_gpu_tensor       *scratch_vals,
+        ds4_gpu_tensor       *scratch_ids,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              markov_w1_offset,
+        uint64_t              markov_w2_offset,
+        uint64_t              confidence_offset,
+        uint32_t              confidence_type,
+        int32_t               token,
+        uint32_t              n_vocab,
+        uint32_t              rank,
+        uint32_t              hidden_dim);
+
+int ds4_gpu_dspark_markov_argmax_confidence_chain_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_confidence,
+        ds4_gpu_tensor       *scratch_vals,
+        ds4_gpu_tensor       *scratch_ids,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              markov_w1_offset,
+        uint64_t              markov_w2_offset,
+        uint64_t              confidence_offset,
+        uint32_t              confidence_type,
+        int32_t               anchor_token,
+        uint32_t              n_steps,
+        uint32_t              n_vocab,
+        uint32_t              rank,
+        uint32_t              hidden_dim);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -338,6 +376,12 @@ int ds4_gpu_matmul_f32_tensor(
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_hc_mean_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hc,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
@@ -694,6 +738,28 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim);
+
+int ds4_gpu_attention_dspark_block_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim);
 
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,

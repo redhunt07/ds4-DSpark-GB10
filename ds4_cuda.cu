@@ -93,6 +93,17 @@ static int g_cublas_ready;
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 
+static int cuda_selected_expert_cache_enabled(void) {
+    return g_ssd_streaming_mode || getenv("DS4_CUDA_SELECTED_EXPERT_CACHE") != NULL;
+}
+static const void *g_dspark_markov_map;
+static uint64_t g_dspark_markov_w1_offset;
+static uint64_t g_dspark_markov_w2_offset;
+static uint64_t g_dspark_markov_w1_bytes;
+static uint64_t g_dspark_markov_w2_bytes;
+static uint16_t *g_dspark_markov_w1_hbm;
+static uint16_t *g_dspark_markov_w2_hbm;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -394,7 +405,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                     cudaGetErrorString(err));
             (void)cudaFree(dev);
             (void)cudaGetLastError();
-            return NULL;
+            return cuda_model_direct_fallback_ptr(model_map, offset);
         }
     }
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
@@ -412,6 +423,19 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
 
+    /* In SSD mode routed experts are owned by the selected-expert streamer.
+     * Do not fall through to the generic range copier when a selected-cache
+     * lookup misses: copying a complete expert matrix is both unnecessary and
+     * unsafe once the bounded HBM arena is full. */
+    if (g_ssd_streaming_mode && what && !strncmp(what, "moe_", 4)) {
+        const char *direct = cuda_model_direct_fallback_ptr(model_map, offset);
+        return direct ? direct : cuda_model_ptr(model_map, offset);
+    }
+
+    const bool dspark_hbm = what &&
+        !strncmp(what, "dspark_markov", strlen("dspark_markov")) &&
+        getenv("DS4_CUDA_DSPARK_MARKOV_HBM") != NULL;
+
     /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
      * direct HBM reads are ~10% faster than mapped reads through host page
      * tables (measured on plain decode at GB10).  Cache lookup runs first; the
@@ -421,10 +445,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes &&
+            (!dspark_hbm || !r.host_registered)) return r.device_ptr;
     }
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+        if (r.host_base == model_map && offset >= r.offset && end >= offset &&
+            end <= r.offset + r.bytes && (!dspark_hbm || !r.host_registered)) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -436,7 +462,9 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if ((g_model_device_owned || g_model_registered) && !dspark_hbm) {
+        return cuda_model_ptr(model_map, offset);
+    }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -448,6 +476,11 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
+    }
+
+    if (dspark_hbm) {
+        const char *device_copy = cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+        if (device_copy) return device_copy;
     }
 
     const char *mapped = cuda_model_range_register_mapped(model_map, offset, bytes, what);
@@ -480,7 +513,14 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    return present ? limit : UINT64_MAX;
+    if (present) return limit;
+    if (g_ssd_streaming_mode) {
+        /* In SSD mode the Q8->F16 acceleration cache competes with the
+         * selected-expert cache and the mapped model working set. Keep a
+         * bounded default; callers can opt into a different size explicitly. */
+        return 0;
+    }
+    return UINT64_MAX;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
@@ -1094,6 +1134,18 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         if (end != env) gb = (uint64_t)v;
         return gb * 1073741824ull;
     }
+    if (g_ssd_streaming_mode) {
+        /* SSD streaming must not silently turn into an 80+ GiB unified-memory
+         * model copy. Keep the device cache bounded; expert residency is
+         * managed separately by the streaming cache. */
+        const char *stream_env = getenv("DS4_CUDA_STREAMING_WEIGHT_CACHE_LIMIT_GB");
+        if (stream_env && stream_env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(stream_env, &end, 10);
+            if (end != stream_env && v > 0) return (uint64_t)v * 1073741824ull;
+        }
+        return 8ull * 1073741824ull;
+    }
     /* One Spark can run the IQ2 model (~81 GiB) and the mixed q2/q4 model
      * (~91 GiB) via the old startup tensor cache.  Keep enough headroom for
      * scratch, KV, and optional Q8->F16 buffers, and make the full-Q4 model
@@ -1195,6 +1247,13 @@ static const char *cuda_model_range_ptr_from_fd(
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    /* Routed MoE tensors are selected and staged by the SSD expert cache.
+     * Never consume the generic HBM arena with a full gate/up/down matrix:
+     * doing so evicts the hot working set and exhausts the arena after a few
+     * layers, forcing the following tokens onto slow mapped reads. */
+    if (g_ssd_streaming_mode && what && !strncmp(what, "moe_", 4)) {
+        return cuda_model_direct_fallback_ptr(model_map, offset);
+    }
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1247,8 +1306,11 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
+            if (dev) {
+                (void)cudaFree(dev);
+            }
             (void)cudaGetLastError();
-            return NULL;
+            return cuda_model_direct_fallback_ptr(model_map, offset);
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
@@ -1292,7 +1354,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
-    if (g_model_device_owned || g_model_registered) return 1;
+    if ((g_model_device_owned || g_model_registered) &&
+        getenv("DS4_CUDA_COPY_MODEL_CHUNKED") == NULL) return 1;
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
@@ -1461,7 +1524,7 @@ static uint32_t cuda_stream_expert_cache_configured_budget(void) {
 }
 
 static int cuda_stream_expert_cache_budget_visible_to_shared(void) {
-    if (!g_ssd_streaming_mode) return 0;
+    if (!cuda_selected_expert_cache_enabled()) return 0;
     if (g_stream_expert_budget_override != 0) return 1;
     const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_N");
     if (env && env[0]) return 1;
@@ -1483,6 +1546,12 @@ static uint64_t cuda_stream_expert_cache_reserve_bytes(void) {
         if (end != env && errno == 0 && end && *end == '\0') {
             gb = (uint64_t)v;
         }
+    } else if (g_model_registered_size >= 64ull * 1073741824ull) {
+        /* GB10 has unified DRAM: leave a small emergency headroom for the
+         * KV allocator and CUDA workspaces, while allowing the selected
+         * expert cache to use the otherwise idle working set.  The live
+         * budget is still clamped against cudaMemGetInfo below. */
+        gb = 1;
     }
     if (gb > UINT64_MAX / 1073741824ull) return UINT64_MAX;
     return gb * 1073741824ull;
@@ -2353,9 +2422,9 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
 }
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
-    const uint64_t min_reserve = 8ull * 1073741824ull;
-    const uint64_t max_reserve = 40ull * 1073741824ull;
-    uint64_t reserve = total_bytes / 4u;
+    const uint64_t min_reserve = 2ull * 1073741824ull;
+    const uint64_t max_reserve = 8ull * 1073741824ull;
+    uint64_t reserve = total_bytes / 32u;
     if (reserve < min_reserve) reserve = min_reserve;
     if (reserve > max_reserve) reserve = max_reserve;
     return reserve;
@@ -2527,6 +2596,10 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 extern "C" int ds4_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_end_commands_async(void) {
+    cuda_model_load_progress_finish();
+    return cuda_ok(cudaGetLastError(), "end commands async");
 }
 extern "C" int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
@@ -2929,7 +3002,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_stream_expert_runtime_gate_bytes = 0;
     g_stream_expert_runtime_down_bytes = 0;
     g_stream_expert_memory_cap_notice = 0;
-    if (!g_ssd_streaming_mode) {
+    if (!cuda_selected_expert_cache_enabled()) {
         cuda_stream_selected_cache_release();
         cuda_stream_expert_cache_release_all();
     }
@@ -2950,7 +3023,16 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) 
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
-    return 0;
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA working set query failed: %s\n", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    (void)free_b;
+    return (uint64_t)total_b;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
@@ -2985,7 +3067,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_selected_expert_cache_enabled()) return 1;
     if (!table) return 0;
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
@@ -3060,7 +3142,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
     cuda_stream_selected_cache_invalidate();
     cuda_model_load_progress_finish();
 
-    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_selected_expert_cache_enabled()) return 1;
     if (!model_map || !compact_ids || !slot_ids ||
         n_total_expert == 0 ||
         compact_count == 0 || compact_count > n_total_expert ||
@@ -3287,7 +3369,7 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_selected_expert_cache_enabled()) return 1;
     if (!table || !selected_ids || n_selected == 0) return 0;
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
@@ -3347,7 +3429,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected) {
-    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_selected_expert_cache_enabled()) return 1;
     if (!table ||
         !selected_ids ||
         table->n_total_expert == 0 ||
@@ -3417,7 +3499,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    if (!g_ssd_streaming_mode) return 1;
+    if (!cuda_selected_expert_cache_enabled()) return 1;
     if (!table) return 0;
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
@@ -3767,6 +3849,16 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
     uint64_t n = (uint64_t)n_embd * n_hc;
     if (i >= n) return;
     out[i] = row[i % n_embd];
+}
+
+__global__ static void hc_mean_kernel(float *out, const float *hc, uint32_t n_embd, uint32_t n_hc) {
+    uint32_t i = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    float sum = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        sum += hc[(uint64_t)h * n_embd + i];
+    }
+    out[i] = sum / (float)n_hc;
 }
 
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
@@ -4307,6 +4399,66 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
+template <int N_TOK>
+__global__ static void grouped_q8_0_a_preq_share_warp_kernel(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim) return;
+
+    const uint64_t group = row / rank;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[N_TOK];
+#pragma unroll
+    for (int tok = 0; tok < N_TOK; tok++) acc[tok] = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float ws = __half2float(*scale_h);
+        if (use_dp4a && bn == 32u) {
+            int32_t wq[8];
+#pragma unroll
+            for (int k = 0; k < 8; k++) wq[k] = load_i8x4_i32_unaligned(qs + k * 4);
+#pragma unroll
+            for (int tok = 0; tok < N_TOK; tok++) {
+                const uint64_t xrow = (uint64_t)tok * n_groups + group;
+                const int8_t *xqb = xq + xrow * blocks * 32 + b * 32;
+                int32_t dot = 0;
+#pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    dot = __dp4a(wq[k], load_i8x4_i32_aligned(xqb + k * 4), dot);
+                }
+                acc[tok] = __fmaf_rn(ws * xscale[xrow * blocks + b], (float)dot, acc[tok]);
+            }
+        } else {
+#pragma unroll
+            for (int tok = 0; tok < N_TOK; tok++) {
+                const uint64_t xrow = (uint64_t)tok * n_groups + group;
+                const int8_t *xqb = xq + xrow * blocks * 32 + b * 32;
+                const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                acc[tok] = __fmaf_rn(ws * xscale[xrow * blocks + b], (float)dot, acc[tok]);
+            }
+        }
+    }
+#pragma unroll
+    for (int tok = 0; tok < N_TOK; tok++) acc[tok] = warp_sum_f32(acc[tok]);
+    if (lane == 0) {
+#pragma unroll
+        for (int tok = 0; tok < N_TOK; tok++) low[(uint64_t)tok * low_dim + row] = acc[tok];
+    }
 }
 
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
@@ -5040,14 +5192,16 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t block_noncausal) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
     const bool single_all = (n_tokens == 1u && ratio == 0u);
     uint32_t qpos = pos0 + t;
+    const uint32_t attend_pos = block_noncausal ? pos0 + n_tokens - 1u : qpos;
     uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
-    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (attend_pos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
@@ -5065,13 +5219,13 @@ __global__ static void attention_decode_mixed_kernel(
             const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
             if (single_all) {
                 raw_count = n_raw > 256u ? 256u : n_raw;
-            } else if (qpos >= first_raw_pos) {
+            } else if (attend_pos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
-                if (window != 0 && qpos + 1u > window) {
-                    const uint32_t wlo = qpos + 1u - window;
+                if (window != 0 && attend_pos + 1u > window) {
+                    const uint32_t wlo = attend_pos + 1u - window;
                     if (wlo > lo) lo = wlo;
                 }
-                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                const uint32_t hi = attend_pos < raw_last_pos ? attend_pos : raw_last_pos;
                 if (hi >= lo) {
                     raw_first_idx = lo - first_raw_pos;
                     raw_count = hi - lo + 1u;
@@ -6242,6 +6396,252 @@ __global__ static void output_hc_weights_kernel(
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
+}
+
+__device__ __forceinline__ static float ds4_bf16_load(const uint16_t *p) {
+    uint32_t bits = (uint32_t)(*p) << 16;
+    return __uint_as_float(bits);
+}
+
+__device__ static void dspark_markov_argmax_phase1_body(
+        float *scratch_vals,
+        int32_t *scratch_ids,
+        const float *logits,
+        const uint16_t *markov_w1,
+        const uint16_t *markov_w2,
+        int32_t token,
+        uint32_t n_vocab,
+        uint32_t rank,
+        float markov_scale) {
+    extern __shared__ float smem[];
+    float *markov = smem;
+    float *red_val = smem + rank;
+    int32_t *red_idx = (int32_t *)(red_val + blockDim.x);
+    if (token < 0 || token >= (int32_t)n_vocab) token = 0;
+    for (uint32_t i = threadIdx.x; i < rank; i += blockDim.x) {
+        markov[i] = ds4_bf16_load(markov_w1 + (uint64_t)token * rank + i);
+    }
+    __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t warps_per_block = blockDim.x >> 5;
+    const uint32_t global_warp = blockIdx.x * warps_per_block + warp;
+    const uint32_t total_warps = gridDim.x * warps_per_block;
+    float best = -INFINITY;
+    int32_t best_id = 0;
+    for (uint32_t vid = global_warp; vid < n_vocab; vid += total_warps) {
+        float bias = 0.0f;
+        const uint64_t base = (uint64_t)vid * rank;
+        for (uint32_t i = lane; i < rank; i += 32u) {
+            bias += markov[i] * ds4_bf16_load(markov_w2 + base + i);
+        }
+        for (uint32_t off = 16u; off > 0; off >>= 1u) {
+            bias += __shfl_down_sync(0xffffffffu, bias, off);
+        }
+        if (lane != 0) continue;
+        const float v = logits[vid] + bias * markov_scale;
+        if (v > best || (v == best && (int32_t)vid < best_id)) {
+            best = v;
+            best_id = (int32_t)vid;
+        }
+    }
+    if (lane == 0) {
+        red_val[warp] = best;
+        red_idx[warp] = best_id;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float block_best = lane < warps_per_block ? red_val[lane] : -INFINITY;
+        int32_t block_best_id = lane < warps_per_block ? red_idx[lane] : 0;
+        for (uint32_t off = 16u; off > 0; off >>= 1u) {
+            const float ov = __shfl_down_sync(0xffffffffu, block_best, off);
+            const int32_t oi = __shfl_down_sync(0xffffffffu, block_best_id, off);
+            if (ov > block_best || (ov == block_best && oi < block_best_id)) {
+                block_best = ov;
+                block_best_id = oi;
+            }
+        }
+        if (lane == 0) {
+            scratch_vals[blockIdx.x] = block_best;
+            scratch_ids[blockIdx.x] = block_best_id;
+        }
+    }
+}
+
+__global__ static void dspark_markov_argmax_phase1_kernel(
+        float *scratch_vals,
+        int32_t *scratch_ids,
+        const float *logits,
+        const uint16_t *markov_w1,
+        const uint16_t *markov_w2,
+        int32_t token,
+        uint32_t n_vocab,
+        uint32_t rank,
+        float markov_scale) {
+    dspark_markov_argmax_phase1_body(scratch_vals,
+                                     scratch_ids,
+                                     logits,
+                                     markov_w1,
+                                     markov_w2,
+                                     token,
+                                     n_vocab,
+                                     rank,
+                                     markov_scale);
+}
+
+__global__ static void dspark_markov_argmax_phase1_chained_kernel(
+        float *scratch_vals,
+        int32_t *scratch_ids,
+        const float *logits,
+        const int32_t *tokens,
+        const uint16_t *markov_w1,
+        const uint16_t *markov_w2,
+        int32_t anchor_token,
+        uint32_t token_index,
+        uint32_t n_vocab,
+        uint32_t rank,
+        float markov_scale) {
+    int32_t token = token_index == 0 ? anchor_token : tokens[token_index - 1u];
+    dspark_markov_argmax_phase1_body(scratch_vals,
+                                     scratch_ids,
+                                     logits,
+                                     markov_w1,
+                                     markov_w2,
+                                     token,
+                                     n_vocab,
+                                     rank,
+                                     markov_scale);
+}
+
+__device__ static void dspark_markov_argmax_confidence_phase2_body(
+        int32_t *out_idx,
+        float *out_confidence,
+        const float *scratch_vals,
+        const int32_t *scratch_ids,
+        const float *hidden,
+        const uint16_t *markov_w1,
+        const void *confidence,
+        uint32_t confidence_type,
+        int32_t token,
+        uint32_t n_blocks,
+        uint32_t rank,
+        uint32_t hidden_dim) {
+    extern __shared__ float smem[];
+    float *markov = smem;
+    float *red_val = smem + rank;
+    int32_t *red_idx = (int32_t *)(red_val + blockDim.x);
+    if (token < 0) token = 0;
+    for (uint32_t i = threadIdx.x; i < rank; i += blockDim.x) {
+        markov[i] = ds4_bf16_load(markov_w1 + (uint64_t)token * rank + i);
+    }
+    __syncthreads();
+    float best = -INFINITY;
+    int32_t best_id = 0;
+    for (uint32_t i = threadIdx.x; i < n_blocks; i += blockDim.x) {
+        const float v = scratch_vals[i];
+        const int32_t id = scratch_ids[i];
+        if (v > best || (v == best && id < best_id)) {
+            best = v;
+            best_id = id;
+        }
+    }
+    red_val[threadIdx.x] = best;
+    red_idx[threadIdx.x] = best_id;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float ov = red_val[threadIdx.x + stride];
+            const int32_t oi = red_idx[threadIdx.x + stride];
+            if (ov > red_val[threadIdx.x] ||
+                (ov == red_val[threadIdx.x] && oi < red_idx[threadIdx.x])) {
+                red_val[threadIdx.x] = ov;
+                red_idx[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    float conf = 0.0f;
+    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+        const float cw = confidence_type == 0u
+            ? ((const float *)confidence)[i]
+            : ds4_bf16_load(((const uint16_t *)confidence) + i);
+        conf += hidden[i] * cw;
+    }
+    for (uint32_t i = threadIdx.x; i < rank; i += blockDim.x) {
+        const uint32_t ci = hidden_dim + i;
+        const float cw = confidence_type == 0u
+            ? ((const float *)confidence)[ci]
+            : ds4_bf16_load(((const uint16_t *)confidence) + ci);
+        conf += markov[i] * cw;
+    }
+    red_val[threadIdx.x] = conf;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) red_val[threadIdx.x] += red_val[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *out_idx = red_idx[0];
+        *out_confidence = red_val[0];
+    }
+}
+
+__global__ static void dspark_markov_argmax_confidence_phase2_kernel(
+        int32_t *out_idx,
+        float *out_confidence,
+        const float *scratch_vals,
+        const int32_t *scratch_ids,
+        const float *hidden,
+        const uint16_t *markov_w1,
+        const void *confidence,
+        uint32_t confidence_type,
+        int32_t token,
+        uint32_t n_blocks,
+        uint32_t rank,
+        uint32_t hidden_dim) {
+    dspark_markov_argmax_confidence_phase2_body(out_idx,
+                                               out_confidence,
+                                               scratch_vals,
+                                               scratch_ids,
+                                               hidden,
+                                               markov_w1,
+                                               confidence,
+                                               confidence_type,
+                                               token,
+                                               n_blocks,
+                                               rank,
+                                               hidden_dim);
+}
+
+__global__ static void dspark_markov_argmax_confidence_phase2_chained_kernel(
+        int32_t *out_idx,
+        float *out_confidence,
+        const float *scratch_vals,
+        const int32_t *scratch_ids,
+        const float *hidden,
+        const int32_t *tokens,
+        const uint16_t *markov_w1,
+        const void *confidence,
+        uint32_t confidence_type,
+        int32_t anchor_token,
+        uint32_t token_index,
+        uint32_t n_blocks,
+        uint32_t rank,
+        uint32_t hidden_dim) {
+    int32_t token = token_index == 0 ? anchor_token : tokens[token_index - 1u];
+    dspark_markov_argmax_confidence_phase2_body(out_idx,
+                                               out_confidence,
+                                               scratch_vals,
+                                               scratch_ids,
+                                               hidden,
+                                               markov_w1,
+                                               confidence,
+                                               confidence_type,
+                                               token,
+                                               n_blocks,
+                                               rank,
+                                               hidden_dim);
 }
 
 __global__ static void compressor_store_kernel(
@@ -8103,6 +8503,237 @@ extern "C" int ds4_gpu_argmax_tensor(
     return cuda_ok(cudaGetLastError(), "argmax launch");
 }
 
+static float dspark_markov_scale_env(void) {
+    float scale = 1.0f;
+    const char *env = getenv("DS4_DSPARK_MARKOV_SCALE");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const float v = strtof(env, &endp);
+        if (endp != env && isfinite(v)) scale = v;
+    }
+    return scale;
+}
+
+static int dspark_markov_hbm_cache(const void *model_map,
+                                   uint64_t w1_offset,
+                                   uint64_t w2_offset,
+                                   uint64_t bytes) {
+    if (!model_map || bytes == 0) return 0;
+    if (g_dspark_markov_map == model_map &&
+        g_dspark_markov_w1_offset == w1_offset &&
+        g_dspark_markov_w2_offset == w2_offset &&
+        g_dspark_markov_w1_bytes == bytes &&
+        g_dspark_markov_w2_bytes == bytes &&
+        g_dspark_markov_w1_hbm && g_dspark_markov_w2_hbm) return 1;
+
+    uint16_t *w1 = NULL;
+    uint16_t *w2 = NULL;
+    if (cudaMalloc((void **)&w1, (size_t)bytes) != cudaSuccess) return 0;
+    if (cudaMalloc((void **)&w2, (size_t)bytes) != cudaSuccess) {
+        (void)cudaFree(w1);
+        return 0;
+    }
+    const char *src = (const char *)model_map;
+    cudaError_t err = cudaMemcpy(w1, src + w1_offset, (size_t)bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = cudaMemcpy(w2, src + w2_offset, (size_t)bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        (void)cudaFree(w1);
+        (void)cudaFree(w2);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_dspark_markov_w1_hbm) (void)cudaFree(g_dspark_markov_w1_hbm);
+    if (g_dspark_markov_w2_hbm) (void)cudaFree(g_dspark_markov_w2_hbm);
+    g_dspark_markov_map = model_map;
+    g_dspark_markov_w1_offset = w1_offset;
+    g_dspark_markov_w2_offset = w2_offset;
+    g_dspark_markov_w1_bytes = bytes;
+    g_dspark_markov_w2_bytes = bytes;
+    g_dspark_markov_w1_hbm = w1;
+    g_dspark_markov_w2_hbm = w2;
+    fprintf(stderr, "ds4: DSpark Markov W1/W2 cached in HBM (%.1f MiB each)\n",
+            (double)bytes / 1048576.0);
+    return 1;
+}
+
+extern "C" int ds4_gpu_dspark_markov_argmax_confidence_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_confidence,
+        ds4_gpu_tensor       *scratch_vals,
+        ds4_gpu_tensor       *scratch_ids,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              markov_w1_offset,
+        uint64_t              markov_w2_offset,
+        uint64_t              confidence_offset,
+        uint32_t              confidence_type,
+        int32_t               token,
+        uint32_t              n_vocab,
+        uint32_t              rank,
+        uint32_t              hidden_dim) {
+    uint32_t blocks = 256;
+    const char *blocks_env = getenv("DS4_DSPARK_MARKOV_BLOCKS");
+    if (blocks_env && blocks_env[0]) {
+        char *endp = NULL;
+        long v = strtol(blocks_env, &endp, 10);
+        if (endp != blocks_env && v >= 32 && v <= 1024) blocks = (uint32_t)v;
+    }
+    if (!out_idx || !out_confidence || !scratch_vals || !scratch_ids ||
+        !logits || !hidden || !model_map ||
+        n_vocab == 0 || rank == 0 || rank > 1024 || hidden_dim == 0 ||
+        out_idx->bytes < sizeof(int32_t) ||
+        out_confidence->bytes < sizeof(float) ||
+        scratch_vals->bytes < (uint64_t)blocks * sizeof(float) ||
+        scratch_ids->bytes < (uint64_t)blocks * sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_vocab * sizeof(float) ||
+        hidden->bytes < (uint64_t)hidden_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t w1_bytes = (uint64_t)n_vocab * rank * sizeof(uint16_t);
+    const uint64_t w2_bytes = (uint64_t)n_vocab * rank * sizeof(uint16_t);
+    const uint64_t conf_elt = confidence_type == 0u ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t conf_bytes = (uint64_t)(hidden_dim + rank) * conf_elt;
+    const char *w1 = cuda_model_range_ptr(model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const char *w2 = cuda_model_range_ptr(model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
+    if (getenv("DS4_DSPARK_MARKOV_HBM") != NULL &&
+        dspark_markov_hbm_cache(model_map, markov_w1_offset, markov_w2_offset, w1_bytes)) {
+        w1 = (const char *)g_dspark_markov_w1_hbm;
+        w2 = (const char *)g_dspark_markov_w2_hbm;
+    }
+    const char *conf = cuda_model_range_ptr(model_map, confidence_offset, conf_bytes, "dspark_confidence");
+    if (!w1 || !w2 || !conf) return 0;
+    uint32_t threads = 256;
+    const char *threads_env = getenv("DS4_DSPARK_MARKOV_THREADS");
+    if (threads_env && threads_env[0]) {
+        char *endp = NULL;
+        long v = strtol(threads_env, &endp, 10);
+        if (endp != threads_env && (v == 128 || v == 256 || v == 512 || v == 1024)) threads = (uint32_t)v;
+    }
+    const size_t smem = (size_t)rank * sizeof(float) +
+                        (size_t)threads * sizeof(float) +
+                        (size_t)threads * sizeof(int32_t);
+    const float markov_scale = dspark_markov_scale_env();
+    dspark_markov_argmax_phase1_kernel<<<blocks, threads, smem>>>(
+            (float *)scratch_vals->ptr,
+            (int32_t *)scratch_ids->ptr,
+            (const float *)logits->ptr,
+            (const uint16_t *)w1,
+            (const uint16_t *)w2,
+            token,
+            n_vocab,
+            rank,
+            markov_scale);
+    dspark_markov_argmax_confidence_phase2_kernel<<<1, threads, smem>>>(
+            (int32_t *)out_idx->ptr,
+            (float *)out_confidence->ptr,
+            (const float *)scratch_vals->ptr,
+            (const int32_t *)scratch_ids->ptr,
+            (const float *)hidden->ptr,
+            (const uint16_t *)w1,
+            (const void *)conf,
+            confidence_type,
+            token,
+            blocks,
+            rank,
+            hidden_dim);
+    return cuda_ok(cudaGetLastError(), "dspark markov argmax confidence launch");
+}
+
+extern "C" int ds4_gpu_dspark_markov_argmax_confidence_chain_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_confidence,
+        ds4_gpu_tensor       *scratch_vals,
+        ds4_gpu_tensor       *scratch_ids,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              markov_w1_offset,
+        uint64_t              markov_w2_offset,
+        uint64_t              confidence_offset,
+        uint32_t              confidence_type,
+        int32_t               anchor_token,
+        uint32_t              n_steps,
+        uint32_t              n_vocab,
+        uint32_t              rank,
+        uint32_t              hidden_dim) {
+    uint32_t blocks = 256;
+    const char *blocks_env = getenv("DS4_DSPARK_MARKOV_BLOCKS");
+    if (blocks_env && blocks_env[0]) {
+        char *endp = NULL;
+        long v = strtol(blocks_env, &endp, 10);
+        if (endp != blocks_env && v >= 32 && v <= 1024) blocks = (uint32_t)v;
+    }
+    if (!out_idx || !out_confidence || !scratch_vals || !scratch_ids ||
+        !logits || !hidden || !model_map ||
+        n_steps == 0 || n_steps > 5 || n_vocab == 0 ||
+        rank == 0 || rank > 1024 || hidden_dim == 0 ||
+        out_idx->bytes < (uint64_t)n_steps * sizeof(int32_t) ||
+        out_confidence->bytes < (uint64_t)n_steps * sizeof(float) ||
+        scratch_vals->bytes < (uint64_t)blocks * sizeof(float) ||
+        scratch_ids->bytes < (uint64_t)blocks * sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_steps * n_vocab * sizeof(float) ||
+        hidden->bytes < (uint64_t)n_steps * hidden_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t w1_bytes = (uint64_t)n_vocab * rank * sizeof(uint16_t);
+    const uint64_t w2_bytes = (uint64_t)n_vocab * rank * sizeof(uint16_t);
+    const uint64_t conf_elt = confidence_type == 0u ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t conf_bytes = (uint64_t)(hidden_dim + rank) * conf_elt;
+    const char *w1 = cuda_model_range_ptr(model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const char *w2 = cuda_model_range_ptr(model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
+    if (getenv("DS4_DSPARK_MARKOV_HBM") != NULL &&
+        dspark_markov_hbm_cache(model_map, markov_w1_offset, markov_w2_offset, w1_bytes)) {
+        w1 = (const char *)g_dspark_markov_w1_hbm;
+        w2 = (const char *)g_dspark_markov_w2_hbm;
+    }
+    const char *conf = cuda_model_range_ptr(model_map, confidence_offset, conf_bytes, "dspark_confidence");
+    if (!w1 || !w2 || !conf) return 0;
+    uint32_t threads = 256;
+    const char *threads_env = getenv("DS4_DSPARK_MARKOV_THREADS");
+    if (threads_env && threads_env[0]) {
+        char *endp = NULL;
+        long v = strtol(threads_env, &endp, 10);
+        if (endp != threads_env && (v == 128 || v == 256 || v == 512 || v == 1024)) threads = (uint32_t)v;
+    }
+    const size_t smem = (size_t)rank * sizeof(float) +
+                        (size_t)threads * sizeof(float) +
+                        (size_t)threads * sizeof(int32_t);
+    const float markov_scale = dspark_markov_scale_env();
+    for (uint32_t row = 0; row < n_steps; row++) {
+        dspark_markov_argmax_phase1_chained_kernel<<<blocks, threads, smem>>>(
+                (float *)scratch_vals->ptr,
+                (int32_t *)scratch_ids->ptr,
+                (const float *)logits->ptr + (uint64_t)row * n_vocab,
+                (const int32_t *)out_idx->ptr,
+                (const uint16_t *)w1,
+                (const uint16_t *)w2,
+                anchor_token,
+                row,
+                n_vocab,
+                rank,
+                markov_scale);
+        dspark_markov_argmax_confidence_phase2_chained_kernel<<<1, threads, smem>>>(
+                (int32_t *)out_idx->ptr + row,
+                (float *)out_confidence->ptr + row,
+                (const float *)scratch_vals->ptr,
+                (const int32_t *)scratch_ids->ptr,
+                (const float *)hidden->ptr + (uint64_t)row * hidden_dim,
+                (const int32_t *)out_idx->ptr,
+                (const uint16_t *)w1,
+                (const void *)conf,
+                confidence_type,
+                anchor_token,
+                row,
+                blocks,
+                rank,
+                hidden_dim);
+    }
+    return cuda_ok(cudaGetLastError(), "dspark markov argmax confidence chain launch");
+}
+
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -8132,7 +8763,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
-    /* Small-batch shared-weight path: at n_tok = 2..4, the hand-rolled warp
+    /* Small-batch shared-weight path: at n_tok = 2..5, the hand-rolled warp
      * kernel reads each weight row once and computes N dot products against
      * N tokens, amortizing weight bandwidth N-fold over the per-token
      * batch_warp8 fallback.  At small N this is meaningfully faster than
@@ -8151,7 +8782,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * its per-layer Q/K/V/O/expert Q8 projections here at n_tok=2, where
      * cuBLAS would pad the f16 M-tile to 16 and waste most of the work. */
     const bool strict_mtp_env = getenv("DS4_MTP_STRICT") != NULL;
-    if (n_tok >= 2u && n_tok <= 4u &&
+    if (n_tok >= 2u && n_tok <= 5u &&
         !strict_mtp_env &&
         getenv("DS4_CUDA_NO_Q8_SHARE_BATCH") == NULL &&
         getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL) {
@@ -8184,6 +8815,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     launched = true;
                 } else if (n_tok == 4u) {
                     matmul_q8_0_preq_batch_share_warp_kernel<4><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                } else if (n_tok == 5u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<5><<<grid_x, 256>>>(
                         (float *)out->ptr,
                         reinterpret_cast<const unsigned char *>(wptr),
                         share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
@@ -8740,6 +9377,16 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     uint64_t n = (uint64_t)n_embd * n_hc;
     repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
+}
+
+extern "C" int ds4_gpu_hc_mean_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, uint32_t n_embd, uint32_t n_hc) {
+    if (!out || !hc || n_embd == 0 || n_hc == 0 ||
+        out->bytes < (uint64_t)n_embd * sizeof(float) ||
+        hc->bytes < (uint64_t)n_embd * n_hc * sizeof(float)) {
+        return 0;
+    }
+    hc_mean_kernel<<<(n_embd + 255) / 256, 256>>>((float *)out->ptr, (const float *)hc->ptr, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "hc_mean launch");
 }
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
@@ -9357,7 +10004,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
-                                                 0, 0, n_head, head_dim);
+                                                   0, 0, n_head, head_dim, 0);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -9480,7 +10127,8 @@ static int attention_decode_batch_launch(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                block_noncausal) {
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
@@ -9500,6 +10148,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
+        if (block_noncausal) return 0;
         if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -9524,7 +10173,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    if (!block_noncausal && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -9555,7 +10204,8 @@ static int attention_decode_batch_launch(
                                                  cf16,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
-                                                 raw_start, n_comp, window, ratio, n_head, head_dim);
+                                                 raw_start, n_comp, window, ratio, n_head, head_dim,
+                                                 block_noncausal);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -9577,7 +10227,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
-                                      n_head, head_dim);
+                                      n_head, head_dim, 0);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -9604,7 +10254,22 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
-                                      n_comp, window, ratio, n_head, head_dim);
+                                      n_comp, window, ratio, n_head, head_dim, 0);
+}
+
+extern "C" int ds4_gpu_attention_dspark_block_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim) {
+    return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
+                                         q, raw_kv, comp_kv, comp_kv_f16,
+                                         comp_mask, use_comp_mask, n_tokens, pos0,
+                                         n_raw, raw_cap, raw_start, n_comp, window,
+                                         ratio, n_head, head_dim, 1);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -10077,17 +10742,32 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                 group_dim,
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
-        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
-                                                          out_a,
-                                                          xq,
-                                                          xscale,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          n_tokens,
-                                                          blocks_a,
-                                                          use_dp4a);
+        const unsigned grid_x = ((unsigned)low_dim + 7u) / 8u;
+        if (n_tokens == 2u && getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_A_SHARE") == NULL) {
+            grouped_q8_0_a_preq_share_warp_kernel<2><<<grid_x, 256>>>(
+                (float *)low->ptr, out_a, xq, xscale, group_dim, rank,
+                n_groups, blocks_a, use_dp4a);
+        } else if (n_tokens == 3u && getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_A_SHARE") == NULL) {
+            grouped_q8_0_a_preq_share_warp_kernel<3><<<grid_x, 256>>>(
+                (float *)low->ptr, out_a, xq, xscale, group_dim, rank,
+                n_groups, blocks_a, use_dp4a);
+        } else if (n_tokens == 4u && getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_A_SHARE") == NULL) {
+            grouped_q8_0_a_preq_share_warp_kernel<4><<<grid_x, 256>>>(
+                (float *)low->ptr, out_a, xq, xscale, group_dim, rank,
+                n_groups, blocks_a, use_dp4a);
+        } else {
+            dim3 grid_a(grid_x, (unsigned)n_tokens, 1);
+            grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                              out_a,
+                                                              xq,
+                                                              xscale,
+                                                              group_dim,
+                                                              rank,
+                                                              n_groups,
+                                                              n_tokens,
+                                                              blocks_a,
+                                                              use_dp4a);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
@@ -13048,7 +13728,7 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int use_stream_selected_cache =
-        g_ssd_streaming_mode &&
+        cuda_selected_expert_cache_enabled() &&
         g_stream_selected_cache.valid &&
         g_stream_selected_cache.model_map == model_map &&
         g_stream_selected_cache.layer == layer_index &&
@@ -13065,6 +13745,21 @@ static int routed_moe_launch(
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
+    if (g_ssd_streaming_mode && !use_stream_selected_cache &&
+        getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA selected-cache mismatch layer=%u required=%llu "
+                "valid=%d cached_layer=%u slots=%u model=%d offsets=%d/%d/%d\n",
+                layer_index,
+                (unsigned long long)required_slot_count,
+                g_stream_selected_cache.valid,
+                g_stream_selected_cache.layer,
+                g_stream_selected_cache.slot_count,
+                g_stream_selected_cache.model_map == model_map,
+                g_stream_selected_cache.gate_offset == gate_offset,
+                g_stream_selected_cache.up_offset == up_offset,
+                g_stream_selected_cache.down_offset == down_offset);
+    }
     const ds4_gpu_tensor *selected_tensor =
         use_stream_selected_cache ? &g_stream_selected_cache.slot_selected_tensor : selected;
     const int32_t *selected_ptr = (const int32_t *)selected_tensor->ptr;

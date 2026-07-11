@@ -483,7 +483,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_spec_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -500,7 +500,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
-        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_spec_draft_tokens(engine) > 1 &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_sample(session,
                                                        token,
@@ -1101,7 +1101,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
                cfg->gen.temperature > 0.0f ||
-               ds4_engine_mtp_draft_tokens(engine) > 1) {
+               ds4_engine_spec_draft_tokens(engine) > 1) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1331,7 +1331,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_spec_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1347,7 +1347,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
-        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_spec_draft_tokens(engine) > 1 &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_sample(chat->session,
                                                        token,
@@ -1654,8 +1654,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.engine.dspark_path = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                                   argv[++i] : DS4_DSPARK_SAME_MODEL;
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            c.engine.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

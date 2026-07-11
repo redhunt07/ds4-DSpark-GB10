@@ -66,6 +66,24 @@ family, plus enough free disk for the temporary output.  Use `--dry-run` and
 `--compare-tensor` before starting a full write, and use `--overwrite` only when
 you really mean to replace an existing GGUF.
 
+When the source checkpoint contains the official DSpark support block
+(`mtp.0.main_proj.weight` plus `mtp.2.markov_head.*`), the quantizer now emits
+the matching `deepseek4.dspark.*` metadata into the output GGUF so `ds4` can
+load it as a real DSpark carrier instead of a legacy MTP fallback.  The emitted
+contract is explicit: `deepseek4.dspark.algorithm`,
+`deepseek4.dspark.carrier_kind`, `deepseek4.dspark.model_id`,
+`deepseek4.dspark.backend_compat`, `deepseek4.dspark.recommended_draft_tokens`
+(kept at `2` so the runtime lands on the optimized combined-forward path),
+`deepseek4.dspark.version`, `deepseek4.dspark.n_mtp_layers`,
+`deepseek4.dspark.block_size`, `deepseek4.dspark.noise_token_id`,
+`deepseek4.dspark.markov_rank`, `deepseek4.dspark.target_layer_ids.*`, and
+`deepseek4.dspark.abliterated`.
+
+For the DSpark abliterated source checkpoint, use the local Hugging Face
+directory downloaded from `Valent1qw/DeepSeek-V4-Flash-DSpark-Abliterated`
+with `--hf`; the quantizer detects the DSpark tensors and writes the matching
+GGUF metadata automatically.
+
 Q2 routed experts with imatrix:
 
 ```sh

@@ -55,6 +55,33 @@ typedef struct {
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
+#define DS4_DSPARK_SAME_MODEL "__DS4_DSPARK_SAME_MODEL__"
+
+typedef enum {
+    DS4_MTP_DRAFT_NONE = 0,
+    DS4_MTP_DRAFT_LEGACY,
+    DS4_MTP_DRAFT_DSPARK,
+    DS4_MTP_DRAFT_DSPARK_NONSEQ,
+} ds4_mtp_draft_kind;
+
+typedef struct {
+    uint32_t n_mtp_layers;
+    uint32_t block_size;
+    uint32_t noise_token_id;
+    uint32_t markov_rank;
+    uint32_t target_layer_ids[3];
+} ds4_dspark_config;
+
+void ds4_dspark_config_init_defaults(ds4_dspark_config *cfg);
+const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind);
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1);
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
+                                               bool has_main_proj,
+                                               bool has_markov_w1,
+                                               bool markov_rank_set,
+                                               uint32_t markov_rank);
+bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind);
+bool ds4_mtp_draft_runtime_supported(ds4_backend backend, ds4_mtp_draft_kind kind);
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
@@ -94,10 +121,12 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dspark_path;
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
+    int dspark_draft_tokens;
     float mtp_margin;
     const char *directional_steering_file;
     const char *expert_profile_path;
@@ -358,8 +387,12 @@ int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
+ds4_mtp_draft_kind ds4_engine_mtp_draft_kind(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
+bool ds4_engine_has_dspark(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+int ds4_engine_dspark_draft_tokens(ds4_engine *e);
+int ds4_engine_spec_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

@@ -48,7 +48,9 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     const char *mtp_path;
+    const char *dspark_path;
     int mtp_draft_tokens;
+    int dspark_draft_tokens;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -312,8 +314,13 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark_path = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                            argv[++i] : DS4_DSPARK_SAME_MODEL;
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            c.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--top-p")) {
@@ -351,8 +358,8 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     if (c.batch_cost) {
-        if (!c.mtp_path) {
-            fprintf(stderr, "ds4-bench: --batch-cost needs --mtp (verify scratch buffers; "
+        if (!c.mtp_path && !c.dspark_path) {
+            fprintf(stderr, "ds4-bench: --batch-cost needs --mtp or --dspark (verify scratch buffers; "
                             "the draft head is not called)\n");
             exit(2);
         }
@@ -792,6 +799,8 @@ int main(int argc, char **argv) {
         .distributed = cfg.dist,
         .mtp_path = cfg.mtp_path,
         .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .dspark_path = cfg.dspark_path,
+        .dspark_draft_tokens = cfg.dspark_draft_tokens,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -858,7 +867,8 @@ int main(int argc, char **argv) {
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
-    const bool use_mtp = cfg.mtp_path != NULL && ds4_engine_mtp_draft_tokens(engine) > 1;
+    const bool use_spec = (cfg.mtp_path != NULL || cfg.dspark_path != NULL) &&
+                          ds4_engine_mtp_draft_tokens(engine) > 1;
     /* Optional decode-token dump for logit-equivalence cross-checks. */
     FILE *tdump = NULL;
     {
@@ -882,7 +892,8 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "ds4-bench: decode path = %s\n",
-            use_mtp ? "MTP speculative combined-forward" : "plain");
+            use_spec ? (cfg.dspark_path ? "DSpark speculative combined-forward" : "MTP speculative combined-forward")
+                     : "plain");
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -996,11 +1007,11 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (use_mtp) {
+            if (use_spec) {
                 /* Speculative decode: one batched verifier forward advances
                  * the accepted prefix (first_token + matching drafts).  Mirrors
                  * the CLI/server decode path so the bench measures the real
-                 * --mtp throughput, not a separate code path. */
+                 * speculative throughput, not a separate code path. */
                 int toks[17];
                 const int ntok = sampled
                     ? ds4_session_eval_speculative_sample(

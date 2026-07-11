@@ -15,16 +15,19 @@
 __pycache__/
 *.pyc
 /.venv/
+.venv-hf/
 /misc/
 .*.swp
 .DS_Store
 /librechat/
+/hf/
 tools/perf/*/runs/
 /tests/cuda_long_context_smoke
 tools/perf/runs.db
 tools/perf/runs/*/
 tests/test_q4k_dot
 tests/cuda_long_context_smoke
+/ds4_agent_test
 
 # wandb offline runs (training telemetry, not source)
 wandb/

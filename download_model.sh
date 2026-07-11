@@ -2,6 +2,7 @@
 set -e
 
 REPO="antirez/deepseek-v4-gguf"
+DSPARK_SOURCE_REPO="Valent1qw/DeepSeek-V4-Flash-DSpark-Abliterated"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
@@ -9,6 +10,7 @@ PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+DSPARK_SOURCE_DIR="DeepSeek-V4-Flash-Abliterated-DSpark"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -16,6 +18,7 @@ case "$OUT_DIR" in
     /*) ;;
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
+DSPARK_SOURCE_OUT=${DS4_HF_DIR:-"$ROOT/hf/$DSPARK_SOURCE_DIR"}
 TOKEN=${HF_TOKEN:-}
 
 usage() {
@@ -31,6 +34,7 @@ Usage:
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
   ./download_model.sh pro-q4-split [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
+  ./download_model.sh dspark-source [--token TOKEN]
 
 Targets:
 
@@ -69,6 +73,10 @@ Targets:
        It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
        enabled explicitly with --mtp when running ds4 or ds4-server.
 
+  dspark-source
+       Download the original DSpark abliterated source checkpoint from
+       Hugging Face into ./hf/. This is the input for deepseek4-quantize.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -101,6 +109,8 @@ MODEL=$1
 shift
 MODEL_FILES=
 LINK_MODEL=1
+MODEL_REPO=$REPO
+MODEL_MODE=gguf
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
@@ -114,6 +124,10 @@ case "$MODEL" in
         LINK_MODEL=0
         ;;
     mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
+    dspark-source)
+        MODEL_MODE=source
+        LINK_MODEL=0
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -149,9 +163,17 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
 fi
 
 needs_hf_download() {
-    case "$1" in
-        "$PRO_Q2_IMATRIX_FILE"|"$PRO_Q4_LAYERS00_30_FILE"|"$PRO_Q4_LAYERS31_OUTPUT_FILE")
+    case "$MODEL_REPO" in
+        "$DSPARK_SOURCE_REPO")
             return 0
+            ;;
+        "$REPO")
+            case "$1" in
+                "$PRO_Q2_IMATRIX_FILE"|"$PRO_Q4_LAYERS00_30_FILE"|"$PRO_Q4_LAYERS31_OUTPUT_FILE")
+                    return 0
+                    ;;
+            esac
+            return 1
             ;;
         *)
             return 1
@@ -182,27 +204,27 @@ download_one_hf() {
     if [ -e "$part" ]; then
         echo "Found curl partial download: $part" >&2
         echo "The Hugging Face downloader cannot resume curl .part files." >&2
-        echo "Move or remove that partial download before retrying this PRO target." >&2
+        echo "Move or remove that partial download before retrying this target." >&2
         exit 1
     fi
 
     HF_CMD=$(find_hf_command || true)
     if [ -z "$HF_CMD" ]; then
-        echo "PRO downloads require the official Hugging Face CLI." >&2
+        echo "This target requires the official Hugging Face CLI." >&2
         echo "Install it with:" >&2
         echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
         exit 1
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$MODEL_REPO"
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+        "$HF_CMD" download "$MODEL_REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
     else
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+        "$HF_CMD" download "$MODEL_REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
 
     if [ ! -s "$out" ]; then
@@ -237,7 +259,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$MODEL_REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
@@ -249,10 +271,41 @@ download_one() {
     mv "$part" "$out"
 }
 
+download_dspark_source() {
+    mkdir -p "$DSPARK_SOURCE_OUT"
+
+    HF_CMD=$(find_hf_command || true)
+    if [ -z "$HF_CMD" ]; then
+        echo "This target requires the official Hugging Face CLI." >&2
+        echo "Install it with:" >&2
+        echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
+        exit 1
+    fi
+
+    echo "Downloading DSpark source checkpoint"
+    echo "from https://huggingface.co/$DSPARK_SOURCE_REPO"
+    echo "into $DSPARK_SOURCE_OUT"
+    echo "using $HF_CMD download"
+    echo "If the download stops, run the same command again to resume it."
+
+    if [ -n "$TOKEN" ]; then
+        "$HF_CMD" download "$DSPARK_SOURCE_REPO" --repo-type model --local-dir "$DSPARK_SOURCE_OUT" --token "$TOKEN" --include '*.safetensors' --include '*.json'
+    else
+        "$HF_CMD" download "$DSPARK_SOURCE_REPO" --repo-type model --local-dir "$DSPARK_SOURCE_OUT" --include '*.safetensors' --include '*.json'
+    fi
+
+    if [ ! -s "$DSPARK_SOURCE_OUT/config.json" ]; then
+        echo "Hugging Face download finished but expected source config is missing: $DSPARK_SOURCE_OUT/config.json" >&2
+        exit 1
+    fi
+}
+
 if [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
         download_one "$file"
     done
+elif [ "$MODEL_MODE" = "source" ]; then
+    download_dspark_source
 else
     download_one "$MODEL_FILE"
 fi
@@ -262,6 +315,11 @@ if [ "$MODEL" = "mtp" ]; then
     echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
+elif [ "$MODEL_MODE" = "source" ]; then
+    echo
+    echo "Downloaded the DSpark source checkpoint to $DSPARK_SOURCE_OUT."
+    echo "To quantize it, run a command like:"
+    echo "  ./quantize_dspark.sh --hf $DSPARK_SOURCE_OUT --out gguf/DeepSeek-V4-Flash-DSpark-Abliterated-Q2.gguf"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

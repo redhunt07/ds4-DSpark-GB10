@@ -1,4 +1,10 @@
-> **This is a fork.** [`TrevorS/ds4`](https://github.com/TrevorS/ds4) is a GB10 / DGX Spark (NVIDIA `sm_121a`) performance fork of [`antirez/ds4`](https://github.com/antirez/ds4). Fork `main` carries the changes below on top of upstream `main`, rebased on upstream periodically (currently on [`59d9bc7`](https://github.com/antirez/ds4/commit/59d9bc7830f2); the rebase is verified bit-identical — perplexity Δ=0, prefill/decode neutral). The speed/accuracy commits live on the [`land`](https://github.com/TrevorS/ds4/tree/land) branch — the upstream-candidate set; [`main`](https://github.com/TrevorS/ds4/tree/main) stacks runtime steering and the in-process Python binding on top. Everything below this section is the upstream README, unchanged.
+> **This is a fork.** [`TrevorS/ds4`](https://github.com/TrevorS/ds4) is a GB10 / DGX Spark (NVIDIA `sm_121a`) performance fork of [`antirez/ds4`](https://github.com/antirez/ds4). Fork `main` carries the changes below on top of upstream `main`, rebased on upstream periodically (currently on [`59d9bc7`](https://github.com/antirez/ds4/commit/59d9bc7830f2); the rebase is verified bit-identical — perplexity Δ=0, prefill/decode neutral). The speed/accuracy commits live on the [`land`](https://github.com/TrevorS/ds4/tree/land) branch — the upstream-candidate set; [`main`](https://github.com/TrevorS/ds4/tree/main) stacks runtime steering and the in-process Python binding on top. `FORK_RELEASE.md` summarizes the public-facing delta and the measured GB10 gains. Everything below this section is the upstream README, unchanged.
+
+## Publication Snapshot
+
+- The repository is now trimmed for publication: local virtualenvs, downloaded HF weights, and throwaway test binaries are not part of the tree.
+- The releaseable source stays focused on the ds4 fork itself: CUDA backend, DSpark runtime, quantization path, server/agent integration, perf tooling, and release docs.
+- For model acquisition, keep using `download_model.sh` and `quantize_dspark.sh`; the weights are intentionally fetched on demand instead of committed.
 
 ## What's different in this fork
 
@@ -324,6 +330,14 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
+If you are using DSpark, download the abliterated DSpark Hugging Face source
+checkpoint and quantize it locally:
+
+```sh
+./download_model.sh dspark-source
+./quantize_dspark.sh --out gguf/DeepSeek-V4-Flash-DSpark-Abliterated-Q2.gguf
+```
+
 For the full PRO Q4 distributed run, download one half on each machine:
 
 ```sh
@@ -351,6 +365,31 @@ GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
 but must be enabled explicitly with `--mtp`. The current MTP/speculative
 decoding path is still experimental: it is correctness-gated and currently
 provides at most a slight speedup, not a meaningful generation-speed win.
+On our GB10 agent workload, the picture is mixed: code-heavy prompts do benefit
+from `--mtp` while prose-heavy prompts can still favor the base path, so keep
+the service on MTP when the target traffic is agent/code generation.
+The long-context KV-disk cache also matters: our repeated 9.3k-token code prompt
+went from about `24.1s` cold prompt time to `3.2s` once `8192` tokens were
+reused from disk, so the service budget is now set to `131072` MiB instead of
+the previous `98304` MiB.
+
+The DSpark branch in this clone accepts `--dspark` as a flag on the main DSpark
+GGUF. Unlike legacy `--mtp`, DSpark is not a second small model path: the DSpark
+worker tensors live inside the converted base model.
+
+For conversion/quantization, the source checkpoint we want is
+`Valent1qw/DeepSeek-V4-Flash-DSpark-Abliterated`, which contains the abliterated
+DSpark safetensors shards plus the DSpark worker tensors. Use `dspark-source` to
+download it, then feed the local directory into `gguf-tools/deepseek4-quantize`.
+If you want the whole flow in one command, use `./quantize_dspark.sh` after the
+source checkpoint is present.
+
+The `abliterated` part is a model-selection requirement, not a runtime flag:
+pick an abliterated DSpark checkpoint before conversion. Run it as:
+
+```sh
+./ds4 --model gguf/DeepSeek-V4-Flash-DSpark-Abliterated-Q2.gguf --dspark
+```
 
 Then build:
 
@@ -907,6 +946,27 @@ path; it is useful only for greedy decoding, currently uses a confidence gate
 (`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
 experimental slight-speedup path.
 
+`--model gguf/DeepSeek-V4-Flash-DSpark-Abliterated-Q2.gguf --dspark` enables
+the DSpark metadata path on a GGUF converted from the DSpark checkpoint. DSpark
+is not a second small model like legacy `--mtp`: the DSpark tensors live inside
+the same base model under the `mtp.*` namespace. The CUDA runtime executes the
+official `main_hidden → main_proj → DSpark stages → Markov → confidence`
+pipeline, then verifies the scheduled drafts with the target microbatch path.
+For greedy generation the cost controller selects a one- or two-draft verifier
+from measured acceptance and iteration cost; set
+`DS4_DSPARK_NO_COST_ADAPTIVE=1` to disable it.
+Deterministic verification is the default. `DS4_CUDA_FAST_VERIFY=1` is an
+explicit throughput mode and may produce a different greedy stream; do not set
+it when token identity with canonical target decode is required.
+
+The GB10 target-forward optimizations are independently reversible for A/B
+tests: `DS4_CUDA_NO_HOT_TARGET_CACHE=1` disables the bounded output/attention/
+router cache, `DS4_CUDA_HOT_TARGET_CACHE_MB=N` changes its 4096 MiB admission
+budget, and `DS4_CUDA_NO_ATTENTION_OUTPUT_A_SHARE=1` disables shared-weight
+attention output-A for N=2/N=3. `DS4_DSPARK_TIMING=1` logs per-iteration
+decisions; session shutdown prints aggregate target/effective throughput,
+acceptance, verifier depth, fallback rate, and phase timings.
+
 ## Server
 
 Start a local OpenAI/Anthropic-compatible server:
@@ -1192,13 +1252,14 @@ the saved prefix instead of processing the whole prompt again.
 ## Thinking Modes
 
 DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+The server defaults to direct replies unless thinking is explicitly enabled.
+`reasoning_effort=max` requests Think Max, but it is only applied when the
+context size is large enough for the model card recommendation; smaller
+contexts fall back to normal thinking. OpenAI `reasoning_effort=xhigh` maps to
+normal thinking.
 
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
+For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or
+`reasoning_effort:low`.
 
 ## Disk KV Cache
 

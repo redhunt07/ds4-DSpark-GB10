@@ -17,8 +17,8 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,8 +28,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_runtime.o
 # Experimental CUDA-graph decode (non-strict, opt-in): build with DS4_GRAPH_DECODE=1.
 # --default-stream per-thread moves the engine's default-stream launches onto a
 # capturable per-thread stream (cudaStreamPerThread), the prerequisite for stream
@@ -187,8 +187,11 @@ libds4.so: ds4_pic.o ds4_cuda_pic.o
 	$(NVCC) $(NVCCFLAGS) -shared -Xcompiler -fPIC -o $@ $^ $(CUDA_LDLIBS)
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_dspark_runtime.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_dspark_runtime.o: ds4_dspark_runtime.c ds4_dspark_runtime.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_dspark_runtime.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
@@ -235,7 +238,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_dspark_runtime.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
