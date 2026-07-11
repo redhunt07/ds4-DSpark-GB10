@@ -103,6 +103,23 @@ Environment variables (perf / observability):
 
 ### Benchmarks (GB10 / DGX Spark)
 
+#### DSpark long-context profile
+
+For the 131072-token context configuration, use the explicit DSpark fast
+verify profile. It keeps the deterministic MoE down path enabled and leaves
+the normal verifier available for A/B and token-identity checks:
+
+```sh
+tools/perf/dspark/run-17tps.sh tests/long_code_audit.txt
+```
+
+The launcher uses the release GGUF, `--ctx 131072`, `--tokens 32768`,
+`-t 10`, and `--prefill-chunk 2048`; SSD streaming is not enabled. On the
+GB10 validation prompt this measured 17.59 generated tok/s and 18.11 effective
+tok/s, versus 14.53 generated tok/s with safe verify. The run reported 94.6%
+combined coverage, `p0=0.854`, and `p1=0.752`. These are decode measurements
+after prefill; results vary with prompt shape, thermal state, and acceptance.
+
 Reproduce the full 8-cell decode matrix — four paths (plain / MTP × greedy / sample) crossed with the accuracy dial (high-accuracy deterministic verify vs the `DS4_CUDA_FAST_VERIFY` Spark fast path) — at 4k–32k context. The matrix sets the accuracy mode per-cell and cools the GPU to ≤55 °C between cells (anti-soak), so one run captures the whole grid:
 
 ```sh
