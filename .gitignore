@@ -28,6 +28,7 @@ tools/perf/runs/*/
 tests/test_q4k_dot
 tests/cuda_long_context_smoke
 /ds4_agent_test
+/kv-cache/
 
 # wandb offline runs (training telemetry, not source)
 wandb/
