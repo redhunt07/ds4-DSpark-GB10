@@ -29,7 +29,10 @@
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
-#define KV_CACHE_PAYLOAD_ABI 3u
+/* Bump whenever prompt/KV reconstruction, hidden-token handling, or the
+ * serialized session state changes. Older checkpoints can have the same
+ * visible token prefix while carrying incompatible frontier/hidden state. */
+#define KV_CACHE_PAYLOAD_ABI 4u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail

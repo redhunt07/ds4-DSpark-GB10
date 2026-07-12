@@ -39,6 +39,10 @@
 #include <time.h>
 #include <unistd.h>
 
+static void server_log(ds4_log_type type, const char *fmt, ...);
+static uint64_t ds4_debug_hash_bytes(const void *data, size_t len);
+static uint64_t ds4_debug_hash_text(const char *text);
+
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
@@ -1728,7 +1732,27 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        chat_msgs_push(msgs, msg);
+        bool skip_placeholder_assistant = false;
+        if (!strcmp(msg.role, "assistant") && msg.calls.len == 0 &&
+            !strcmp(msg.content, "!")) {
+            skip_placeholder_assistant = true;
+        }
+        if (skip_placeholder_assistant) {
+            chat_msg_free(&msg);
+        } else if (!strcmp(msg.role, "user") && msgs->len > 0 &&
+                   !strcmp(msgs->v[msgs->len - 1].role, "user")) {
+            chat_msg *previous = &msgs->v[msgs->len - 1];
+            buf merged = {0};
+            buf_puts(&merged, previous->content ? previous->content : "");
+            if (previous->content && previous->content[0] &&
+                msg.content && msg.content[0]) buf_putc(&merged, '\n');
+            buf_puts(&merged, msg.content ? msg.content : "");
+            free(previous->content);
+            previous->content = buf_take(&merged);
+            chat_msg_free(&msg);
+        } else {
+            chat_msgs_push(msgs, msg);
+        }
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
         if (**p == ',') (*p)++;
@@ -2344,6 +2368,22 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
+    if (getenv("DS4_PROMPT_DIAGNOSTICS") != NULL && msgs) {
+        buf shape = {0};
+        for (int i = 0; i < msgs->len; i++) {
+            const chat_msg *m = &msgs->v[i];
+            if (i) buf_putc(&shape, ',');
+            buf_printf(&shape, "%s:%zu:%d:%016llx",
+                       m->role ? m->role : "?",
+                       m->content ? strlen(m->content) : 0,
+                       m->calls.len,
+                       (unsigned long long)ds4_debug_hash_text(m->content ? m->content : ""));
+        }
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: prompt shape messages=%d tools=%d shape=%s",
+                   msgs->len, tool_context ? 1 : 0, shape.ptr ? shape.ptr : "");
+        buf_free(&shape);
+    }
     int last_user_idx = -1;
     buf system = {0};
     /* Render tool schemas before the client system content so
@@ -3484,7 +3524,23 @@ item_fail:
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
                 msg.reasoning = buf_take(&pending_reasoning);
             }
-            chat_msgs_push(msgs, msg);
+            if (!strcmp(msg.role, "assistant") && msg.calls.len == 0 &&
+                !strcmp(msg.content, "!")) {
+                chat_msg_free(&msg);
+            } else if (!strcmp(msg.role, "user") && msgs->len > 0 &&
+                       !strcmp(msgs->v[msgs->len - 1].role, "user")) {
+                chat_msg *previous = &msgs->v[msgs->len - 1];
+                buf merged = {0};
+                buf_puts(&merged, previous->content ? previous->content : "");
+                if (previous->content && previous->content[0] &&
+                    msg.content && msg.content[0]) buf_putc(&merged, '\n');
+                buf_puts(&merged, msg.content ? msg.content : "");
+                free(previous->content);
+                previous->content = buf_take(&merged);
+                chat_msg_free(&msg);
+            } else {
+                chat_msgs_push(msgs, msg);
+            }
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
             tool_call tc = {0};
             tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
@@ -4605,6 +4661,13 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
 
     for (;;) {
         p = skip_ascii_ws(p);
+        /* Some DSML checkpoints occasionally echo the opening marker twice
+         * (the first marker is also present in the assistant prefix).  The
+         * duplicate marker is syntax noise, not a second tool invocation. */
+        while (!strncmp(p, tool_calls_start, strlen(tool_calls_start))) {
+            p += strlen(tool_calls_start);
+            p = skip_ascii_ws(p);
+        }
         if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_dsml);
@@ -4883,6 +4946,17 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
+    if (getenv("DS4_HTTP_DEBUG") != NULL) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: http response code=%d type=%s bytes=%zu hash=%016llx",
+                   code, type ? type : "", body_len,
+                   (unsigned long long)ds4_debug_hash_bytes(body ? body : "", body_len));
+        if (getenv("DS4_HTTP_DEBUG_RAW") != NULL && body && body_len) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: http response raw=%.*s",
+                       (int)(body_len > 4096 ? 4096 : body_len), body);
+        }
+    }
     buf h = {0};
     buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
@@ -5870,6 +5944,14 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
+            const char *duplicate_start = !strcmp(ts->tool_calls_end, DS4_TOOL_CALLS_END) ?
+                DS4_TOOL_CALLS_START :
+                (!strcmp(ts->tool_calls_end, DS4_TOOL_CALLS_END_SHORT) ?
+                    DS4_TOOL_CALLS_START_SHORT : "<tool_calls>");
+            while (raw_full_lit(raw, raw_len, ts->parse_pos, duplicate_start)) {
+                ts->parse_pos += strlen(duplicate_start);
+                while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            }
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->tool_calls_end);
                 ts->active = false;
@@ -7399,6 +7481,10 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
+            while (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_start)) {
+                ts->parse_pos += strlen(ts->syn->tool_calls_start);
+                while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            }
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->syn->tool_calls_end);
                 ts->active = false;
@@ -7714,6 +7800,41 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     }
     va_end(ap);
     fputc('\n', stderr);
+}
+
+static uint64_t ds4_debug_hash_bytes(const void *data, size_t len) {
+    const unsigned char *p = data;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t ds4_debug_hash_text(const char *text) {
+    return ds4_debug_hash_bytes(text ? text : "", text ? strlen(text) : 0);
+}
+
+static int ds4_debug_count_text(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return 0;
+    int count = 0;
+    size_t n = strlen(needle);
+    for (const char *p = text; (p = strstr(p, needle)) != NULL; p += n) count++;
+    return count;
+}
+
+static void ds4_debug_token_text(ds4_engine *engine, int token, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    size_t len = 0;
+    char *text = ds4_token_text(engine, token, &len);
+    if (text) {
+        size_t n = len < cap - 1 ? len : cap - 1;
+        memcpy(out, text, n);
+        out[n] = '\0';
+    }
+    free(text);
 }
 
 typedef struct job job;
@@ -9360,6 +9481,7 @@ static void trace_finish(
         const request *r,
         const char *final_finish,
         int completion,
+        int first_sampled_token,
         bool saw_tool_start,
         bool saw_tool_end,
         const char *parsed_content,
@@ -9376,6 +9498,35 @@ static void trace_finish(
             saw_tool_start ? 1 : 0,
             saw_tool_end ? 1 : 0,
             elapsed);
+    char first_token_text[128];
+    ds4_debug_token_text(s->engine, ds4_token_eos(s->engine),
+                         first_token_text, sizeof(first_token_text));
+    char sampled_text[128];
+    ds4_debug_token_text(s->engine, first_sampled_token,
+                         sampled_text, sizeof(sampled_text));
+    fprintf(s->trace,
+            "prompt_tokens: %d\nprompt_bytes: %zu\nprompt_hash: %016llx\n"
+            "first_sampled_token: %d\nfirst_sampled_text: %s\n"
+            "bos_id: %d\neos_id: %d\npad_id: %d\ndsml_id: %d\n"
+            "think_start_id: %d\nthink_end_id: %d\nassistant_id: %d\n"
+            "eos_text: %s\nstop_count: %d\n",
+            r->prompt.len,
+            r->prompt_text ? strlen(r->prompt_text) : 0,
+            (unsigned long long)ds4_debug_hash_text(r->prompt_text),
+            first_sampled_token, sampled_text,
+            ds4_token_bos(s->engine), ds4_token_eos(s->engine),
+            ds4_token_pad(s->engine), ds4_token_dsml(s->engine),
+            ds4_token_think_start(s->engine), ds4_token_think_end(s->engine),
+            ds4_token_assistant(s->engine), first_token_text, r->stops.len);
+    for (int i = 0; i < r->stops.len; i++) {
+        fprintf(s->trace, "stop[%d]: %s\n", i, r->stops.v[i]);
+    }
+    if (parsed_content) {
+        fprintf(s->trace, "content_bytes: %zu\ncontent_hash: %016llx\n",
+                strlen(parsed_content),
+                (unsigned long long)ds4_debug_hash_text(parsed_content));
+    }
+    fprintf(s->trace, "tool_call_count: %d\n", parsed_calls ? parsed_calls->len : 0);
     if (r->kind == REQ_CHAT) {
         if (parsed_reasoning && parsed_reasoning[0]) {
             fputs("\nreasoning:\n", s->trace);
@@ -9748,7 +9899,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) {
+        if (p->srv && current >= p->prompt_tokens && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv);
         }
         return;
@@ -9789,7 +9940,10 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) {
+    /* Do not snapshot a live session while prefill is still mutating its KV
+     * frontier. Intermediate payloads can have the right token prefix but an
+     * incomplete compressor/hidden-state frontier when restored later. */
+    if (p->srv && current >= p->prompt_tokens && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
     }
 }
@@ -10090,6 +10244,21 @@ static const struct { const char *suffix; float ffn; } k_steer_tiers[] = {
     { ":subtle", 1.0f },   /* deepseek-v4-flash:<profile>:subtle  */
     { ":strong", 3.0f },   /* deepseek-v4-flash:<profile>:strong  */
 };
+
+static bool ds4_server_hidden_token(ds4_engine *engine, int token) {
+    if (token == ds4_token_bos(engine) || token == ds4_token_eos(engine) ||
+        token == ds4_token_pad(engine) || token == ds4_token_dsml(engine) ||
+        token == ds4_token_think_start(engine) || token == ds4_token_think_end(engine) ||
+        token == ds4_token_user(engine) || token == ds4_token_assistant(engine)) {
+        return true;
+    }
+    size_t len = 0;
+    char *piece = ds4_token_text(engine, token, &len);
+    bool hidden = (piece && ((strstr(piece, "<｜") != NULL && strstr(piece, "｜>") != NULL) ||
+                            !strcmp(piece, "<think>") || !strcmp(piece, "</think>")));
+    free(piece);
+    return hidden;
+}
 
 static void generate_job(server *s, job *j) {
     char err[160];
@@ -10433,6 +10602,22 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    if (getenv("DS4_PROMPT_DIAGNOSTICS") != NULL) {
+        const char *prompt_text = j->req.prompt_text ? j->req.prompt_text : "";
+        const char *assistant = "<｜Assistant｜>";
+        const bool assistant_suffix =
+            strstr(prompt_text, "<｜Assistant｜><think>") != NULL ||
+            strstr(prompt_text, "<｜Assistant｜></think>") != NULL;
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: prompt diagnostics ctx=%s tokens=%d bytes=%zu hash=%016llx "
+                   "bos=%d bos_count=%d assistant_count=%d assistant_suffix=%d tool_context=%d",
+                   ctx_span, j->req.prompt.len, strlen(prompt_text),
+                   (unsigned long long)ds4_debug_hash_text(prompt_text),
+                   ds4_token_bos(s->engine),
+                   ds4_debug_count_text(prompt_text, "<｜begin▁of▁sentence｜>"),
+                   ds4_debug_count_text(prompt_text, assistant), assistant_suffix ? 1 : 0,
+                   j->req.has_tools ? 1 : 0);
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10519,6 +10704,7 @@ decode_again:
     size_t stop_scan_from = 0;
     const char *finish = "length";
     int completion = 0;
+    int first_sampled_token = -1;
     int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
     bool saw_tool_start = false;
@@ -10564,9 +10750,37 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_bos(s->engine) ||
-            token == ds4_token_eos(s->engine)) {
+        int token = completion == 0 ?
+            ds4_session_sample_excluding2(s->session,
+                                          temperature, top_k, top_p, min_p, &rng,
+                                          ds4_token_bos(s->engine),
+                                          ds4_token_eos(s->engine)) :
+            ds4_session_sample_excluding(s->session,
+                                         temperature, top_k, top_p, min_p, &rng,
+                                         ds4_token_bos(s->engine));
+        if (completion == 0 && first_sampled_token < 0)
+            first_sampled_token = token;
+        if (completion == 0 && ds4_server_hidden_token(s->engine, token)) {
+            const int hidden_ids[] = {
+                ds4_token_bos(s->engine), ds4_token_eos(s->engine), ds4_token_pad(s->engine),
+                ds4_token_dsml(s->engine), ds4_token_think_start(s->engine),
+                ds4_token_think_end(s->engine), ds4_token_user(s->engine),
+                ds4_token_assistant(s->engine),
+            };
+            int best = ds4_session_argmax_excluding_ids(
+                s->session, hidden_ids, (int)(sizeof(hidden_ids) / sizeof(hidden_ids[0])));
+            if (best >= 0 && !ds4_server_hidden_token(s->engine, best)) {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s corrected first special token=%d to=%d",
+                               ctx_span, token, best);
+                    token = best;
+            }
+        }
+        if (token == ds4_token_eos(s->engine)) {
+            server_log(completion == 0 ? DS4_LOG_WARNING : DS4_LOG_GENERATION,
+                       "ds4-server: chat ctx=%s %s stop selected=%d bos=%d eos=%d completion=%d",
+                       ctx_span, completion == 0 ? "first-token" : "eos",
+                       token, ds4_token_bos(s->engine), ds4_token_eos(s->engine), completion);
             finish = "stop";
             break;
         }
@@ -10581,7 +10795,8 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (completion > 0 &&
+            temperature <= 0.0f &&
             ds4_engine_spec_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
             getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)
@@ -10598,7 +10813,8 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (temperature > 0.0f &&
+        } else if (completion > 0 &&
+                   temperature > 0.0f &&
                    ds4_engine_spec_draft_tokens(s->engine) > 1 &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
                    getenv("DS4_DSPARK_SPEC_DISABLE") == NULL)
@@ -10630,9 +10846,23 @@ decode_again:
             token = toks[ti];
             if (token == ds4_token_bos(s->engine) ||
                 token == ds4_token_eos(s->engine)) {
+                if (completion == 0) {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s speculative first-token stop selected=%d bos=%d eos=%d ntok=%d",
+                               ctx_span, token, ds4_token_bos(s->engine),
+                               ds4_token_eos(s->engine), ntok);
+                }
                 finish = "stop";
                 stop_decode = true;
                 break;
+            }
+            if (ds4_server_hidden_token(s->engine, token)) {
+                if (completion == 0) {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s skipped special token=%d",
+                               ctx_span, token);
+                }
+                continue;
             }
 
             size_t piece_len = 0;
@@ -11032,6 +11262,7 @@ decode_again:
                            responses_protocol);
 
     trace_finish(s, trace_id, &j->req, final_finish, completion,
+                 first_sampled_token,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
@@ -11649,6 +11880,14 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok && getenv("DS4_HTTP_DEBUG_RAW") != NULL && req.raw_body) {
+        size_t raw_len = strlen(req.raw_body);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: http request raw bytes=%zu hash=%016llx body=%.*s",
+                   raw_len,
+                   (unsigned long long)ds4_debug_hash_bytes(req.raw_body, raw_len),
+                   (int)(raw_len > 8192 ? 8192 : raw_len), req.raw_body);
+    }
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);

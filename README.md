@@ -295,6 +295,19 @@ riduce il rischio di throttling termico sostenuto sul GB10 e può mantenere un
 throughput più stabile rispetto a `--power 100`. È il valore consigliato per
 sessioni Pi Code lunghe. Log:
 
+Default di generazione consigliati per il fork:
+
+```json
+{
+  "_from_model_config": true,
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "do_sample": true,
+  "temperature": 1.0,
+  "top_p": 1.0
+}
+```
+
 ```sh
 journalctl -u ds4-server.service -f
 ```
@@ -343,6 +356,21 @@ Variabili utili:
 | `DS4_DSPARK_NO_COST_ADAPTIVE=1` | Disabilita scheduler adattivo |
 | `DS4_CUDA_NO_HBM_CACHE=1` | A/B senza cache pesi HBM; solo debug |
 | `DS4_CUDA_HOT_TARGET_CACHE_MB=N` | Budget cache target |
+| `DS4_PROMPT_DIAGNOSTICS=1` | Log hash, token count e invarianti del prompt; nessun contenuto |
+| `DS4_HTTP_DEBUG=1` | Log codice, tipo, dimensione e hash delle risposte HTTP |
+| `DS4_HTTP_DEBUG_RAW=1` | Log anche i primi 4096 byte della risposta; solo debug locale, può contenere dati sensibili |
+
+Per una diagnosi di output troncato usare temporaneamente:
+
+```sh
+DS4_PROMPT_DIAGNOSTICS=1 DS4_HTTP_DEBUG=1 ./ds4-server ...
+```
+
+Con `--trace FILE` il record di ogni richiesta include prompt hash, token
+speciali, primo token campionato, stop list, contenuto finale e numero di
+tool call. Le variabili diagnostiche sono disabilitate nel servizio di
+produzione; `DS4_HTTP_DEBUG_RAW` non va mai lasciata attiva su una macchina
+con dati utente.
 
 Quando si modifica CUDA, verificare sempre token, acceptance e qualità su
 coding, chat, tool call e long context. Non considerare sufficiente un aumento

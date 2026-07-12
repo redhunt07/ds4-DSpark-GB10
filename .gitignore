@@ -9,7 +9,9 @@
 /libds4.so
 /ds4flash.gguf
 /TODO.md
-/gguf/
+!/gguf/
+/gguf/*
+!/gguf/DeepSeek-V4-Flash-DSpark-Abliterated-COMBINED-Q2.generation_config.json
 *.o
 *.dSYM/
 __pycache__/

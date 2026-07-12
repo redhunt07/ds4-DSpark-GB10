@@ -23414,6 +23414,7 @@ struct ds4_vocab {
     int n_vocab;
     int bos_id;
     int eos_id;
+    int pad_id;
     int user_id;
     int assistant_id;
     int think_start_id;
@@ -24081,6 +24082,16 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
+    int pad_id = -1;
+    /* DeepSeek tokenizers use both spellings across model revisions. */
+    const char *pad_names[] = {"<｜▁pad▁｜>", "<｜pad｜>"};
+    vocab->pad_id = -1;
+    for (size_t i = 0; i < sizeof(pad_names) / sizeof(pad_names[0]); i++) {
+        if (table_get(&vocab->token_to_id, pad_names[i], strlen(pad_names[i]), &pad_id)) {
+            vocab->pad_id = pad_id;
+            break;
+        }
+    }
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
@@ -24364,6 +24375,22 @@ int ds4_token_bos(ds4_engine *e) {
 
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+int ds4_token_pad(ds4_engine *e) {
+    return e->vocab.pad_id;
+}
+
+int ds4_token_dsml(ds4_engine *e) {
+    return e->vocab.dsml_id;
+}
+
+int ds4_token_think_start(ds4_engine *e) {
+    return e->vocab.think_start_id;
+}
+
+int ds4_token_think_end(ds4_engine *e) {
+    return e->vocab.think_end_id;
 }
 
 int ds4_token_user(ds4_engine *e) {
@@ -30461,6 +30488,28 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     return best;
 }
 
+int ds4_session_argmax_excluding_ids(ds4_session *s, const int *excluded_ids, int excluded_count) {
+    if (!s || !s->logits) return -1;
+    int best = -1;
+    float best_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        bool excluded = false;
+        for (int j = 0; excluded_ids && j < excluded_count; j++) {
+            if ((int)i == excluded_ids[j]) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+        const float v = s->logits[i];
+        if (best < 0 || v > best_logit) {
+            best = (int)i;
+            best_logit = v;
+        }
+    }
+    return best;
+}
+
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
@@ -30469,6 +30518,107 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+}
+
+static int sample_argmax_excluding(const float *logits, uint32_t n_vocab, int excluded_id1, int excluded_id2) {
+    int best = -1;
+    float best_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if ((int)i == excluded_id1 || (int)i == excluded_id2) continue;
+        const float v = logits[i];
+        if (best < 0 || v > best_logit) {
+            best = (int)i;
+            best_logit = v;
+        }
+    }
+    return best;
+}
+
+static int sample_top_p_min_p_excluding(const float *logits, uint32_t n_vocab,
+                                        float temperature, int top_k, float top_p,
+                                        float min_p, uint64_t *rng,
+                                        int excluded_id1, int excluded_id2) {
+    if (temperature <= 0.0f) {
+        return sample_argmax_excluding(logits, n_vocab, excluded_id1, excluded_id2);
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k <= 0) {
+        top_k = (int)n_vocab;
+    }
+    if (top_k > 1024) top_k = 1024;
+    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
+
+    int ids[1024];
+    float vals[1024];
+    int n = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if ((int)i == excluded_id1 || (int)i == excluded_id2) continue;
+        float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (n == top_k && v <= vals[n - 1]) continue;
+        int j = n < top_k ? n++ : n - 1;
+        while (j > 0 && vals[j - 1] < v) {
+            vals[j] = vals[j - 1];
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        vals[j] = v;
+        ids[j] = (int)i;
+    }
+    if (n == 0) return sample_argmax_excluding(logits, n_vocab, excluded_id1, excluded_id2);
+
+    float probs[1024];
+    const float max_logit = vals[0];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        probs[i] = expf((vals[i] - max_logit) / temperature);
+        sum += probs[i];
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+
+    const float min_prob = (probs[0] / sum) * min_p;
+    float filtered_sum = 0.0f;
+    int filtered = 0;
+    for (int i = 0; i < n; i++) {
+        float p = probs[i] / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += probs[i];
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered <= 0) return ids[0];
+
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (int i = 0; i < filtered; i++) {
+        r -= probs[i];
+        if (r <= 0.0f) return ids[i];
+    }
+    return ids[filtered - 1];
+}
+
+int ds4_session_sample_excluding(ds4_session *s, float temperature, int top_k,
+                                 float top_p, float min_p, uint64_t *rng,
+                                 int excluded_id) {
+    if (!s || !s->logits || excluded_id < 0 || excluded_id >= (int)DS4_N_VOCAB) {
+        return ds4_session_sample(s, temperature, top_k, top_p, min_p, rng);
+    }
+    return sample_top_p_min_p_excluding(s->logits, DS4_N_VOCAB,
+                                        temperature, top_k, top_p, min_p, rng,
+                                        excluded_id, -1);
+}
+
+int ds4_session_sample_excluding2(ds4_session *s, float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng,
+                                  int excluded_id1, int excluded_id2) {
+    if (!s || !s->logits) return -1;
+    const bool valid1 = excluded_id1 >= 0 && excluded_id1 < (int)DS4_N_VOCAB;
+    const bool valid2 = excluded_id2 >= 0 && excluded_id2 < (int)DS4_N_VOCAB &&
+                        excluded_id2 != excluded_id1;
+    return sample_top_p_min_p_excluding(s->logits, DS4_N_VOCAB,
+                                        temperature, top_k, top_p, min_p, rng,
+                                        valid1 ? excluded_id1 : -1,
+                                        valid2 ? excluded_id2 : -1);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
