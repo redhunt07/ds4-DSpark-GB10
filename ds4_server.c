@@ -48,6 +48,7 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+#define DS4_SERVER_JOB_TIMEOUT_SEC 3600
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -118,6 +119,19 @@ static char *xstrndup(const char *s, size_t n) {
 static bool env_flag_on(const char *name) {
     const char *value = getenv(name);
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static double server_job_timeout_sec(void) {
+    const char *v = getenv("DS4_SERVER_JOB_TIMEOUT_SEC");
+    if (!v || !v[0]) return DS4_SERVER_JOB_TIMEOUT_SEC;
+    char *end = NULL;
+    errno = 0;
+    double seconds = strtod(v, &end);
+    if (errno || end == v || *end || !isfinite(seconds) || seconds <= 0.0)
+        return DS4_SERVER_JOB_TIMEOUT_SEC;
+    /* A very small timeout is useful for fault-injection, but accidental
+     * values must not make every normal request fail immediately. */
+    return seconds < 1.0 ? 1.0 : seconds;
 }
 
 static void buf_reserve(buf *b, size_t add) {
@@ -9575,6 +9589,7 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    double deadline;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -9873,6 +9888,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (!is_chunk && !is_display) return;
 
     double now = now_sec();
+    if (p->deadline > 0.0 && now >= p->deadline) {
+        p->stream_failed = true;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: %s ctx=%s prefill watchdog expired current=%d total=%d",
+                   p->kind == REQ_CHAT ? "chat" : "completion",
+                   p->ctx, current, total);
+        return;
+    }
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
@@ -10446,7 +10469,7 @@ static void generate_job(server *s, job *j) {
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
-    const int prompt_tokens = prompt_for_sync->len;
+    int prompt_tokens = prompt_for_sync->len;
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -10454,6 +10477,7 @@ static void generate_job(server *s, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
+    const double job_deadline = t0 + server_job_timeout_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
@@ -10469,6 +10493,7 @@ static void generate_job(server *s, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .deadline = job_deadline,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -10586,6 +10611,19 @@ static void generate_job(server *s, job *j) {
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    if (now_sec() >= job_deadline) {
+        snprintf(err, sizeof(err), "prefill watchdog timeout after %.0f seconds",
+                 server_job_timeout_sec());
+        ds4_session_invalidate(s->session);
+        ds4_tokens_free(&effective_prompt);
+        ds4_session_set_progress(s->session, NULL, NULL);
+        ds4_session_set_display_progress(s->session, NULL, NULL);
+        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        free(disk_cache_path);
+        trace_event(s, trace_id, "prefill watchdog timeout");
+        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        return;
+    }
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
@@ -10695,6 +10733,7 @@ static void generate_job(server *s, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
+    bool first_tool_frontier_rebuild_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
 decode_again:
@@ -10729,7 +10768,7 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && now_sec() < job_deadline && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -10797,6 +10836,63 @@ decode_again:
                            "ds4-server: chat ctx=%s recovered first EOS=%d to=%d for tool request",
                            ctx_span, token, recovered);
                 token = recovered;
+            }
+        }
+        if (completion == 0 && j->req.kind == REQ_CHAT && j->req.has_tools) {
+            /* A literal `!` at the first tool-continuation position is not
+             * repaired by choosing another token from the same logits: that
+             * would hide a bad live-KV frontier. Rebuild from the complete
+             * client prompt once, then retry the turn. If the full prompt also
+             * yields `!`, report it as a real model/runtime failure. */
+            size_t first_len = 0;
+            char *first_piece = ds4_token_text(s->engine, token, &first_len);
+            const bool placeholder = first_piece && first_len == 1 && first_piece[0] == '!';
+            free(first_piece);
+            if (placeholder) {
+                if (!first_tool_frontier_rebuild_attempted) {
+                    first_tool_frontier_rebuild_attempted = true;
+                    ds4_session_invalidate(s->session);
+                    char rebuild_err[160] = {0};
+                    if (ds4_session_sync(s->session, &j->req.prompt,
+                                         rebuild_err, sizeof(rebuild_err)) == 0) {
+                        cached = 0;
+                        cache_source = "first-tool-frontier-rebuild";
+                        prompt_for_sync = &j->req.prompt;
+                        prompt_tokens = j->req.prompt.len;
+                        j->req.cache_read_tokens = 0;
+                        j->req.cache_write_tokens = prompt_tokens;
+                        responses_live_continuation = false;
+                        anthropic_live_continuation = false;
+                        thinking_live_continuation = false;
+                        responses_live_clear(s);
+                        anthropic_live_clear(s);
+                        request_ctx_span(ctx_span, sizeof(ctx_span), 0, prompt_tokens);
+                        trace_event(s, trace_id,
+                                    "first tool token was !; rebuilt complete prompt tokens=%d; retrying",
+                                    prompt_tokens);
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: chat ctx=%s first tool token was !; rebuilt complete prompt and retrying",
+                                   ctx_span);
+                        buf_free(&text);
+                        goto decode_again;
+                    }
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "tool continuation frontier invalid and full-prompt rebuild failed: %s",
+                             rebuild_err[0] ? rebuild_err : "unknown error");
+                    trace_event(s, trace_id, "first tool placeholder rebuild failed: %s", err);
+                } else {
+                    finish = "error";
+                    snprintf(err, sizeof(err),
+                             "model returned invalid first tool token ! after full-prompt rebuild");
+                    trace_event(s, trace_id, "invalid first tool token ! persisted after rebuild");
+                }
+                if (strcmp(finish, "error") == 0) {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s invalid first tool token ! finish=error",
+                               ctx_span);
+                    break;
+                }
             }
         }
         if (token == ds4_token_eos(s->engine)) {
@@ -11069,6 +11165,18 @@ decode_again:
         if (stop_decode) break;
     }
 
+    if (!g_stop_requested && now_sec() >= job_deadline && strcmp(finish, "error") != 0) {
+        finish = "error";
+        snprintf(err, sizeof(err), "generation watchdog timeout after %.0f seconds",
+                 server_job_timeout_sec());
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: %s ctx=%s watchdog expired generation=%d session_pos=%d",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span, completion, ds4_session_pos(s->session));
+        trace_event(s, trace_id, "watchdog timeout generation=%d session_pos=%d",
+                    completion, ds4_session_pos(s->session));
+    }
+
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
@@ -11289,6 +11397,21 @@ decode_again:
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
+
+    if (j->req.kind == REQ_CHAT && completion == 0 && !parsed_calls.len &&
+        strcmp(final_finish, "error") != 0) {
+        /* Empty successful turns are almost always a control-token or cache
+         * frontier regression. Keep the response protocol-valid, but make the
+         * event unmistakable in production diagnostics. A literal `!` is a
+         * client-side placeholder and is not treated as generated content. */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: chat ctx=%s empty successful completion finish=%s first_token=%d session_pos=%d",
+                   ctx_span, final_finish, first_sampled_token,
+                   ds4_session_pos(s->session));
+        trace_event(s, trace_id,
+                    "empty successful completion finish=%s first_token=%d session_pos=%d",
+                    final_finish, first_sampled_token, ds4_session_pos(s->session));
+    }
 
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
@@ -11644,8 +11767,16 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        const double started = now_sec();
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: worker start kind=%d fd=%d queued=%s timeout=%.0fs",
+                   (int)j->req.kind, j->fd, j->req.stream ? "stream" : "buffered",
+                   server_job_timeout_sec());
         if (j->req.kind == REQ_STEERING_CONTROL) handle_steering_control(s, j);
         else generate_job(s, j);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: worker finish kind=%d fd=%d elapsed=%.3fs",
+                   (int)j->req.kind, j->fd, now_sec() - started);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);

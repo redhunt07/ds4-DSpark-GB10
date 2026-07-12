@@ -347,7 +347,7 @@ Variabili utili:
 
 | Variabile | Uso |
 |---|---|
-| `DS4_CUDA_FAST_VERIFY=1` | Verifier CUDA veloce; throughput, possibile differenza greedy |
+| `DS4_CUDA_FAST_VERIFY=1` | Verifier CUDA veloce sperimentale; possibile differenza greedy anche su logit vicini |
 | `DS4_CUDA_NO_INDEXED_HEADS8=1` | Disabilita il ramo attention heads8 non canonico; consigliato a contesto lungo |
 | `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1` | Riduzione MoE deterministica |
 | `DS4_GRAPH_DECODE=1` | CUDA graph decode |

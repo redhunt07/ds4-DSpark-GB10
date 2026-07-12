@@ -2792,14 +2792,10 @@ static char find_answer_letter(const char *generated, int nchoices) {
         }
     }
 
-    for (const char *p = visible + strlen(visible); p > visible; p--) {
-        char c = (char)toupper((unsigned char)p[-1]);
-        if (c >= 'A' && c <= max_answer) {
-            char before = p - 1 == visible ? ' ' : p[-2];
-            char after = p[0];
-            if (is_letter_boundary(before, after)) return c;
-        }
-    }
+    /* Never guess from arbitrary prose.  The previous reverse scan turned a
+     * truncated chain-of-thought (which commonly mentions choices A/B/C/D)
+     * into a false grade. A benchmark answer is valid only when the model
+     * emits the explicit final marker requested by the prompt. */
     return '?';
 }
 
@@ -3756,13 +3752,17 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     bool generation_in_think = ds4_think_mode_enabled(think_mode);
     eval_think_close_info think_close = {0};
     ds4_tokens think_close_tokens = {0};
+    ds4_tokens forced_answer_prefix_tokens = {0};
     if (generation_in_think) ds4_tokenize_text(engine, "</think>", &think_close_tokens);
+    ds4_tokenize_text(engine, "\nAnswer:", &forced_answer_prefix_tokens);
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
+    int forced_answer_pos = -1;
+    bool hard_close_answer_pending = false;
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -3777,6 +3777,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
+                ds4_tokens_free(&forced_answer_prefix_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_QUIT;
             }
@@ -3791,6 +3792,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
+                ds4_tokens_free(&forced_answer_prefix_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
@@ -3810,6 +3812,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
+                ds4_tokens_free(&forced_answer_prefix_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_QUIT;
             }
@@ -3824,6 +3827,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
+                ds4_tokens_free(&forced_answer_prefix_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
@@ -3841,14 +3845,23 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
          * top of the distribution.  The hard limit is a uniform benchmark rule:
          * leave a fixed answer reserve instead of failing a case because all
          * tokens were spent before the visible answer could start. */
-        if (generation_in_think && think_close_tokens.len > 0) {
+        if (generation_in_think && think_close_tokens.len > 0 &&
+            forced_answer_pos < 0) {
             if (forced_close_pos >= 0) {
                 token = think_close_tokens.v[forced_close_pos++];
-                if (forced_close_pos >= think_close_tokens.len) forced_close_pos = -1;
+                if (forced_close_pos >= think_close_tokens.len) {
+                    forced_close_pos = -1;
+                    if (hard_close_answer_pending) {
+                        forced_answer_pos = 0;
+                        hard_close_answer_pending = false;
+                    }
+                }
             } else if (remaining_budget <= cfg->hard_limit_reply_budget) {
                 close_kind = EVAL_THINK_CLOSE_HARD;
                 token = think_close_tokens.v[0];
                 forced_close_pos = think_close_tokens.len > 1 ? 1 : -1;
+                if (forced_close_pos < 0) forced_answer_pos = 0;
+                else hard_close_answer_pending = true;
             } else if (remaining_budget <= cfg->soft_limit_reply_budget &&
                        think_close_tokens.len == 1) {
                 close_rank = token_rank_in_top(session, think_close_tokens.v[0],
@@ -3859,9 +3872,50 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 }
             }
         }
+        if (token < 0 && forced_answer_pos >= 0) {
+            token = forced_answer_prefix_tokens.v[forced_answer_pos++];
+            if (forced_answer_pos >= forced_answer_prefix_tokens.len)
+                forced_answer_pos = -1;
+        }
         if (token < 0)
-            token = ds4_session_sample(session, cfg->temperature, 0,
-                                       cfg->top_p, cfg->min_p, rng);
+            /* BOS is a prompt/control token, never a valid generated answer.
+             * Allow EOS to terminate normally, but do not feed BOS back into
+             * the live KV session: doing so creates an immediate BOS loop on
+             * long-context DSpark evaluation runs. The HTTP server applies the
+             * same invariant in its production sampler. */
+            token = ds4_session_sample_excluding(session, cfg->temperature, 0,
+                                                 cfg->top_p, cfg->min_p, rng,
+                                                 ds4_token_bos(engine));
+        if (ui->generated == 0) {
+            /* The assistant prefix is already in the prompt.  A control token
+             * as the first continuation (most commonly BOS after a restored
+             * or numerically marginal frontier) would be fed back into KV and
+             * can cascade into BOS/EOS loops. Match the server's production
+             * recovery: replace any first special token with the best visible
+             * token, preserving the model's logits instead of fabricating a
+             * text token or accepting an invalid empty answer. */
+            const int hidden_ids[] = {
+                ds4_token_bos(engine), ds4_token_eos(engine), ds4_token_pad(engine),
+                ds4_token_dsml(engine), ds4_token_think_start(engine),
+                ds4_token_think_end(engine), ds4_token_user(engine),
+                ds4_token_assistant(engine),
+            };
+            bool hidden = false;
+            for (size_t hi = 0; hi < sizeof(hidden_ids) / sizeof(hidden_ids[0]); hi++) {
+                if (token == hidden_ids[hi]) { hidden = true; break; }
+            }
+            if (hidden) {
+                int visible = ds4_session_argmax_excluding_ids(
+                    session, hidden_ids,
+                    (int)(sizeof(hidden_ids) / sizeof(hidden_ids[0])));
+                if (visible >= 0) {
+                    fprintf(stderr,
+                            "ds4-eval: corrected first control token=%d to=%d\n",
+                            token, visible);
+                    token = visible;
+                }
+            }
+        }
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -3881,6 +3935,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                              &think_close);
             free(question);
             ds4_tokens_free(&think_close_tokens);
+            ds4_tokens_free(&forced_answer_prefix_tokens);
             buf_free(&raw);
             return EVAL_RUN_ERROR;
         }
@@ -3948,6 +4003,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
     free(question);
     ds4_tokens_free(&think_close_tokens);
+    ds4_tokens_free(&forced_answer_prefix_tokens);
     buf_free(&raw);
     return EVAL_RUN_OK;
 }

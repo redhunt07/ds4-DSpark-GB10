@@ -21,7 +21,7 @@ caught at rebase time anyway. So: prefix forward, don't rewrite history.
 
 | flag | effect |
 | --- | --- |
-| `DS4_CUDA_FAST_VERIFY` | **MTP speed knob (Spark default).** Route the speculative *verify* forward through the fast batched cuBLAS kernels (heads8 attention + batched MoE) instead of the deterministic N=1 ordered path. ~+15% decode @4k greedy. See below. |
+| `DS4_CUDA_FAST_VERIFY` | **Experimental MTP speed knob.** Route speculative verification through fast batched kernels. It can change near-tied greedy choices; use only after a model/context-specific regression gate. |
 | `DS4_GRAPH_DECODE` | CUDA-graph plain-greedy decode (+~5%, bit-identical). |
 | `DS4_NO_F16_PREWARM` | skip the Q8→f16 dense-weight prewarm (faster CLI launch, slower first prefill). |
 | `DS4_MTP_NO_CASCADE` | force the N=2 (K=1) MTP window instead of cascaded N=3. |
@@ -47,10 +47,11 @@ Measured ladder (GB10, IQ2XXS model, MTP-v2 head, ctx=4096, `--gen-tokens 128
 | MTP on + `DS4_CUDA_FAST_VERIFY=1` | 21.52 | 2.21× |
 
 Rules of thumb:
-- **Greedy output is token-identical** (token-diff 0/256) to the deterministic
-  path — agents/tools run greedy, so it's a free ~15%. This is why it's the Spark
-  production default.
-- It is **not bit-exact**: `--temp > 0` sampled fidelity differs slightly.
+- **Do not assume greedy identity**: fast floating-point reductions can change a
+  near-tied token. The deterministic path is the production correctness
+  reference; fast mode is an opt-in performance experiment.
+- It is **not bit-exact**: sampled fidelity can differ, and greedy can differ on
+  close logits as well.
 - **Never set it when running the correctness gates** (`ds4_test --mtp-correctness`
   / `--mtp-selfconsistency`). Those exist to validate the *deterministic* path and
   assert `worst_rms=0`; the flag is process-global, so it flips the test's own

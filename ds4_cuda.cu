@@ -2519,20 +2519,16 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
     return ds4_gpu_tensor_read(tensor, offset, data, bytes);
 }
 
-/* DS4_CUDA_FAST_VERIFY=1 is "Spark fast mode": it disables ALL the deterministic-
- * verify machinery that otherwise defaults onto the non-verify path (the batched
- * heads8 attention dispatch, the n=1 ordered F16 GEMM, the fused A1/A2 pair).
- * Greedy output is token-identical to the deterministic default; only sampled
- * fidelity and the --mtp-correctness/--mtp-selfconsistency gates rely on the
- * deterministic path, and those run without this flag.  Cached: read once. */
+/* DS4_CUDA_FAST_VERIFY=1 is "Spark fast mode": it selects the approximate
+ * batched verify kernels.  It is an optimization of speculative verification,
+ * not a correctness mode: floating-point reduction order can change logits and
+ * therefore can change a near-tied greedy choice.  The deterministic gates
+ * clear this environment variable, so this must be read dynamically.  A
+ * process-wide cached value made those gates lie after fast mode had been used
+ * once (unsetenv() could not actually restore deterministic behavior). */
 static int ds4_cuda_fast_verify(void) {
-    static int g_fast = 0;
-    static int g_init = 0;
-    if (!g_init) {                       /* one-time env read */
-        g_fast = (getenv("DS4_CUDA_FAST_VERIFY") != NULL);
-        g_init = 1;
-    }
-    return g_fast;
+    const char *value = getenv("DS4_CUDA_FAST_VERIFY");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -9130,13 +9126,14 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     /* Deterministic MTP verify is the DEFAULT (bit-exact to canonical, worst_rms=0) —
      * the verify F16 GEMMs route through the batch-invariant WMMA path for the small
      * n_tok verify regime.  DS4_CUDA_FAST_VERIFY=1 opts into the faster non-deterministic
-     * cuBLAS verify (~6% decode on GB10); greedy output is token-identical either way
-     * (validated), so the fast path is what we run on Spark.  DS4_CUDA_ORDERED_F16_MAX_TOKENS
+     * cuBLAS verify (~6% decode on GB10); the fast path is approximate and may
+     * change near-tied greedy choices.  DS4_CUDA_ORDERED_F16_MAX_TOKENS
      * overrides the small-batch threshold for tuning. */
     /* Spark fast mode routes EVERYTHING (incl. n_tok=1 plain decode) through cuBLAS:
      * the ordered WMMA-bi/scalar path exists only to keep the n=1 canonical row
      * bit-identical to the n>1 verify batch, which plain/greedy decode never needs
-     * (proven token-identical).  Default keeps the small-batch verify regime ordered. */
+     * (not guaranteed token-identical).  Default keeps the small-batch verify
+     * regime ordered. */
     uint64_t ordered_max_tokens = ds4_cuda_fast_verify() ? 0u : 8u;
     {
         const char *ord_env = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
@@ -9247,7 +9244,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
          * canonical comp_kv/comp_sc take the SAME WMMA path as the n>1 combined verify
          * (the scalar pair kernel here vs WMMA there would otherwise amplify through the
          * indexer/router top-k).  DS4_CUDA_FAST_VERIFY=1 keeps the fused scalar pair. */
-        getenv("DS4_CUDA_FAST_VERIFY") == NULL) {
+        !ds4_cuda_fast_verify()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
@@ -10340,8 +10337,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      *
      * Set DS4_CUDA_INDEXED_HEADS8=1 to opt back into the fast heads8 kernels
      * (online by default, or rb4 via DS4_CUDA_INDEXED_TWOPASS) for the
-     * approximate-but-equal-speed path.  DS4_CUDA_FAST_VERIFY=1 (Spark fast mode)
-     * implies it: the batched path here is prefill + the n>1 combined verify, and
+     * approximate path.  DS4_CUDA_FAST_VERIFY=1 (Spark fast mode) implies it:
+     * the batched path here is prefill + the n>1 combined verify, and
      * the slow N=1 reference kernel here is the proven prefill regression (~1.5x)
      * — the deterministic match only matters for the correctness gates, which run
      * without FAST_VERIFY. */

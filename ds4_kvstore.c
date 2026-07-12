@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1058,6 +1059,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = kv_buf_take(&tmpb);
     const double save_t0 = kv_now_sec();
+    int saved_errno = 0;
     FILE *fp = fopen(tmp, "wb");
     if (!fp) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1092,7 +1094,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
               fflush(fp) == 0;
-    int saved_errno = errno;
+    /* fflush only transfers bytes to the kernel.  A power loss between the
+     * close/rename sequence and journal commit could otherwise leave a valid
+     * name with a truncated payload.  Keep the existing atomic temp+rename
+     * protocol, but make the checkpoint durable before publishing it. */
+    if (ok) {
+        int fd = fileno(fp);
+        if (fd < 0 || fsync(fd) != 0) ok = false;
+        if (!ok && !saved_errno) saved_errno = errno;
+    }
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
         ok = false;
@@ -1110,6 +1120,27 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     if (ok && rename(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
+    }
+    if (ok) {
+        char *slash = strrchr(path, '/');
+        const char *dir = ".";
+        char *dir_copy = NULL;
+        if (slash) {
+            size_t n = (size_t)(slash - path);
+            dir_copy = malloc(n + 1);
+            if (dir_copy) {
+                memcpy(dir_copy, path, n);
+                dir_copy[n] = '\0';
+                dir = dir_copy[0] ? dir_copy : ".";
+            }
+        }
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd < 0 || fsync(dfd) != 0) {
+            if (!saved_errno) saved_errno = errno;
+            ok = false;
+        }
+        if (dfd >= 0) close(dfd);
+        free(dir_copy);
     }
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
     if (!ok) {

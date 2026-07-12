@@ -18470,6 +18470,8 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    const char *fast_verify_env = getenv("DS4_CUDA_FAST_VERIFY");
+    const bool fast_verify = fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -18513,7 +18515,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * tiny verify window so the per-row N=1 ds4_gpu_attention_decode_heads_tensor runs
      * (byte-identical). DS4_CUDA_FAST_VERIFY=1 -> 0 = use the fast batched kernel.
      * Prefill (large n) and the canonical N=1 path are untouched either way. */
-    uint32_t ordered_attn_max_tokens = (getenv("DS4_CUDA_FAST_VERIFY") != NULL) ? 0u : 8u;
+    uint32_t ordered_attn_max_tokens = fast_verify ? 0u : 8u;
     {
         const char *oamt = getenv("DS4_CUDA_ORDERED_ATTN_MAX_TOKENS");
         if (oamt && oamt[0]) {
@@ -18921,7 +18923,7 @@ static bool metal_graph_encode_layer_attention_batch(
          * batch_attn_norm, in=DS4_N_EMBD) into one grouped WMMA launch in the
          * deterministic verify mode — bit-identical to the separate calls. */
         const int verify_group_a1 = (n_tokens <= 8u &&
-                                     getenv("DS4_CUDA_FAST_VERIFY") == NULL);
+                                     !fast_verify);
         if (ok && verify_group_a1) {
             ds4_gpu_tensor *gouts[2] = { g->batch_comp_kv, g->batch_comp_sc };
             const uint64_t goffs[2] = { layer->attn_compressor_kv->abs_offset,
@@ -19239,7 +19241,7 @@ static bool metal_graph_encode_layer_attention_batch(
              * indexer_weights is computed here (moved up; it's independent of the
              * indexer_q block below) and skipped at its original site. */
             const int verify_group = (n_tokens <= 8u &&
-                                      getenv("DS4_CUDA_FAST_VERIFY") == NULL);
+                                      !fast_verify);
             if (ok && verify_group) {
                 ds4_gpu_tensor *gouts[3] = { g->batch_comp_kv, g->batch_comp_sc,
                                              g->batch_indexer_weights };
@@ -20144,6 +20146,8 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    const char *fast_verify_env = getenv("DS4_CUDA_FAST_VERIFY");
+    const bool fast_verify = fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -20511,7 +20515,7 @@ static bool metal_graph_encode_layer_ffn_batch(
      * the byte-identical N=1 kernel/order. DS4_CUDA_FAST_VERIFY=1 keeps the fast batched
      * MoE.  (n_tokens<=8 limits this to the verify regime; prefill is large.) */
     const bool verify_ordered_moe = (ok && n_tokens > 1 && n_tokens <= 8 &&
-                                     getenv("DS4_CUDA_FAST_VERIFY") == NULL);
+                                     !fast_verify);
     if (ok && verify_ordered_moe) {
         for (uint32_t t = 0; t < n_tokens && ok; t++) {
             ds4_gpu_tensor *out_view =
@@ -28841,8 +28845,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 fprintf(stderr,
                         "ds4: official DSpark speculative runtime enabled: main_hidden/main_proj/stage/Markov/confidence\n");
             }
+            const char *fast_verify_env = getenv("DS4_CUDA_FAST_VERIFY");
             if (e->backend == DS4_BACKEND_CUDA &&
-                getenv("DS4_CUDA_FAST_VERIFY") != NULL &&
+                fast_verify_env != NULL && fast_verify_env[0] != '\0' &&
+                strcmp(fast_verify_env, "0") != 0 &&
                 getenv("DS4_CUDA_STRICT_VERIFY") == NULL) {
                 fprintf(stderr,
                         "ds4: WARNING: CUDA fast verify enabled for DSpark; "
