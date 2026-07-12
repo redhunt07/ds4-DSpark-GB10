@@ -10776,6 +10776,29 @@ decode_again:
                     token = best;
             }
         }
+        if (completion == 0 && token == ds4_token_eos(s->engine) &&
+            j->req.kind == REQ_CHAT && j->req.has_tools) {
+            /* A restored long-context/tool frontier can leave the sampler
+             * with EOS as its first candidate even though the assistant must
+             * still produce an action.  Do not change normal chat semantics:
+             * recover only tool-enabled requests and choose the canonical
+             * non-control argmax instead of sampling another special token. */
+            const int hidden_ids[] = {
+                ds4_token_bos(s->engine), ds4_token_eos(s->engine), ds4_token_pad(s->engine),
+                ds4_token_dsml(s->engine), ds4_token_think_start(s->engine),
+                ds4_token_think_end(s->engine), ds4_token_user(s->engine),
+                ds4_token_assistant(s->engine),
+            };
+            int recovered = ds4_session_argmax_excluding_ids(
+                s->session, hidden_ids,
+                (int)(sizeof(hidden_ids) / sizeof(hidden_ids[0])));
+            if (recovered >= 0 && !ds4_server_hidden_token(s->engine, recovered)) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s recovered first EOS=%d to=%d for tool request",
+                           ctx_span, token, recovered);
+                token = recovered;
+            }
+        }
         if (token == ds4_token_eos(s->engine)) {
             server_log(completion == 0 ? DS4_LOG_WARNING : DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s %s stop selected=%d bos=%d eos=%d completion=%d",
