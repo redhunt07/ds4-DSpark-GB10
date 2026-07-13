@@ -799,9 +799,92 @@ static bool reasoning_has_repeated_suffix(const char *text, size_t len,
     return false;
 }
 
+/* Normalize one completed reasoning line for a conservative semantic-loop
+ * check.  Models commonly alternate "Actually, let me ..." with
+ * "Let me ..." while expressing the same stalled action. */
+static size_t reasoning_normalize_line(const char *line, size_t len,
+                                       char *out, size_t out_cap) {
+    while (len && isspace((unsigned char)*line)) { line++; len--; }
+    while (len && isspace((unsigned char)line[len - 1])) len--;
+    static const char *prefixes[] = {
+        "actually, ", "actually ", "now, ", "now ", "okay, ", "okay "
+    };
+    bool stripped = true;
+    while (stripped) {
+        stripped = false;
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            size_t n = strlen(prefixes[i]);
+            if (len < n || strncasecmp(line, prefixes[i], n)) continue;
+            line += n;
+            len -= n;
+            while (len && isspace((unsigned char)*line)) { line++; len--; }
+            stripped = true;
+            break;
+        }
+    }
+    if (!out_cap) return 0;
+    size_t used = 0;
+    bool pending_space = false;
+    for (size_t i = 0; i < len && used + 1 < out_cap; i++) {
+        unsigned char c = (unsigned char)line[i];
+        if (isspace(c)) { pending_space = used > 0; continue; }
+        if (pending_space && used + 1 < out_cap) out[used++] = ' ';
+        pending_space = false;
+        out[used++] = (char)tolower(c);
+    }
+    while (used && (out[used - 1] == '.' || out[used - 1] == '!' ||
+                    out[used - 1] == '?' || isspace((unsigned char)out[used - 1])))
+        used--;
+    out[used] = '\0';
+    return used;
+}
+
+/* Return the first line of a three-occurrence loop among the most recent
+ * completed reasoning lines.  Requiring a reasonably long normalized line
+ * avoids treating short discourse markers as a stalled action. */
+static bool reasoning_has_repeated_line_intent(const char *text, size_t len,
+                                               size_t *cutoff_out) {
+    if (!text || len < 72) return false;
+    typedef struct { size_t start; char normalized[512]; } reasoning_line;
+    reasoning_line recent[12];
+    int count = 0;
+    size_t pos = 0;
+    while (pos < len) {
+        const char *nl = memchr(text + pos, '\n', len - pos);
+        if (!nl) break; /* never classify a partially streamed line */
+        size_t end = (size_t)(nl - text);
+        char normalized[512];
+        size_t n = reasoning_normalize_line(text + pos, end - pos,
+                                            normalized, sizeof(normalized));
+        if (n >= 24) {
+            if (count == (int)(sizeof(recent) / sizeof(recent[0]))) {
+                memmove(recent, recent + 1, sizeof(recent) - sizeof(recent[0]));
+                count--;
+            }
+            recent[count].start = pos;
+            memcpy(recent[count].normalized, normalized, n + 1);
+            count++;
+        }
+        pos = end + 1;
+    }
+    for (int last = count - 1; last >= 2; last--) {
+        int matches[3] = {-1, -1, last};
+        int found = 1;
+        for (int i = last - 1; i >= 0 && found < 3; i--) {
+            if (!strcmp(recent[i].normalized, recent[last].normalized))
+                matches[2 - found++] = i;
+        }
+        if (found == 3) {
+            if (cutoff_out) *cutoff_out = recent[matches[0]].start;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A client may replay streamed reasoning on the next tool turn.  Collapse a
- * detected suffix run to one copy before rendering that history, otherwise a
- * loop we just stopped becomes a strong prompt pattern for the next request. */
+ * detected loop before rendering that history.  Remove the whole looping
+ * segment rather than retaining one seed per historical tool turn. */
 static int chat_msgs_trim_repeated_reasoning(chat_msgs *msgs) {
     int trimmed_copies = 0;
     for (int i = 0; msgs && i < msgs->len; i++) {
@@ -809,17 +892,26 @@ static int chat_msgs_trim_repeated_reasoning(chat_msgs *msgs) {
         if (!reasoning) continue;
         size_t len = strlen(reasoning);
         size_t period = 0;
-        if (!reasoning_has_repeated_suffix(reasoning, len, &period)) continue;
-
-        size_t run_start = len - 4 * period;
-        while (run_start >= period &&
-               !memcmp(reasoning + run_start - period,
-                       reasoning + len - period, period))
-            run_start -= period;
-        const int copies = (int)((len - run_start) / period);
-        if (copies < 4) continue;
-        reasoning[run_start + period] = '\0';
-        trimmed_copies += copies - 1;
+        size_t cutoff = SIZE_MAX;
+        int copies = 0;
+        if (reasoning_has_repeated_suffix(reasoning, len, &period)) {
+            cutoff = len - 4 * period;
+            while (cutoff >= period &&
+                   !memcmp(reasoning + cutoff - period,
+                           reasoning + len - period, period))
+                cutoff -= period;
+            copies = (int)((len - cutoff) / period);
+        }
+        size_t line_cutoff = SIZE_MAX;
+        if (reasoning_has_repeated_line_intent(reasoning, len, &line_cutoff) &&
+            line_cutoff < cutoff) {
+            cutoff = line_cutoff;
+            copies = 3;
+        }
+        if (cutoff == SIZE_MAX) continue;
+        while (cutoff && isspace((unsigned char)reasoning[cutoff - 1])) cutoff--;
+        reasoning[cutoff] = '\0';
+        trimmed_copies += copies;
     }
     return trimmed_copies;
 }
@@ -11543,15 +11635,21 @@ decode_again:
             free(piece);
 
             if (thinking_gates_tool_markers && thinking.inside &&
-                !reasoning_loop_recovery_attempted &&
-                reasoning_has_repeated_suffix(text.ptr, text.len,
-                                              &repeating_reasoning_period))
+                !reasoning_loop_recovery_attempted)
             {
-                /* Finish consuming this speculative batch before injecting a
-                 * forced close: its accepted tokens are already represented
-                 * in the live KV frontier. */
-                reasoning_loop_recovery_attempted = true;
-                close_repeating_reasoning_after_batch = true;
+                size_t semantic_cutoff = 0;
+                bool exact_loop = reasoning_has_repeated_suffix(
+                    text.ptr, text.len, &repeating_reasoning_period);
+                bool semantic_loop = reasoning_has_repeated_line_intent(
+                    text.ptr, text.len, &semantic_cutoff);
+                if (exact_loop || semantic_loop) {
+                    /* Finish consuming this speculative batch before injecting
+                     * a forced close: its accepted tokens are already represented
+                     * in the live KV frontier. */
+                    reasoning_loop_recovery_attempted = true;
+                    close_repeating_reasoning_after_batch = true;
+                    if (!exact_loop) repeating_reasoning_period = 0;
+                }
             }
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -11702,12 +11800,14 @@ decode_again:
                 tool_scan_waiting_for_think_close = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s repeated reasoning loop "
-                           "period=%zu; forced </think> after %d generated tokens",
+                           "kind=%s period=%zu; forced </think> after %d generated tokens",
                            ctx_span, req_flags[0] ? " " : "", req_flags,
+                           repeating_reasoning_period ? "exact" : "line-intent",
                            repeating_reasoning_period, completion);
                 trace_event(s, trace_id,
-                            "repeated reasoning loop period=%zu; forced </think> "
+                            "repeated reasoning loop kind=%s period=%zu; forced </think> "
                             "after %d generated tokens",
+                            repeating_reasoning_period ? "exact" : "line-intent",
                             repeating_reasoning_period, completion);
                 continue;
             }
@@ -16462,9 +16562,9 @@ static void test_reasoning_repetition_guard(void) {
     chat_msg assistant = {.role = xstrdup("assistant")};
     assistant.reasoning = xstrdup(text.ptr);
     chat_msgs_push(&msgs, assistant);
-    TEST_ASSERT(chat_msgs_trim_repeated_reasoning(&msgs) == 3);
+    TEST_ASSERT(chat_msgs_trim_repeated_reasoning(&msgs) == 4);
     TEST_ASSERT(strlen(msgs.v[0].reasoning) ==
-                strlen("I need to inspect dependencies first.\n\n") + strlen(phrase));
+                strlen("I need to inspect dependencies first."));
     TEST_ASSERT(!reasoning_has_repeated_suffix(msgs.v[0].reasoning,
                                                strlen(msgs.v[0].reasoning),
                                                &period));
@@ -16472,9 +16572,30 @@ static void test_reasoning_repetition_guard(void) {
 
     buf_free(&text);
     buf_puts(&text,
+             "The PowerShell quoting is causing issues. Let me use a simpler command.\n\n"
+             "Actually, let me check the colyseus 0.17 package source.\n\n"
+             "Let me check the colyseus 0.17 package source.\n\n"
+             "Actually, let me check the colyseus 0.17 package source.\n\n");
+    size_t semantic_cutoff = SIZE_MAX;
+    TEST_ASSERT(reasoning_has_repeated_line_intent(text.ptr, text.len,
+                                                   &semantic_cutoff));
+    TEST_ASSERT(semantic_cutoff ==
+                strlen("The PowerShell quoting is causing issues. Let me use a simpler command.\n\n"));
+    assistant = (chat_msg){.role = xstrdup("assistant"),
+                           .reasoning = xstrdup(text.ptr)};
+    chat_msgs_push(&msgs, assistant);
+    TEST_ASSERT(chat_msgs_trim_repeated_reasoning(&msgs) == 3);
+    TEST_ASSERT(!strcmp(msgs.v[0].reasoning,
+                        "The PowerShell quoting is causing issues. Let me use a simpler command."));
+    chat_msgs_free(&msgs);
+
+    buf_free(&text);
+    buf_puts(&text,
              "Compare package.json, package-lock.json, server/package.json, "
              "and client/package.json before changing dependencies.");
     TEST_ASSERT(!reasoning_has_repeated_suffix(text.ptr, text.len, &period));
+    TEST_ASSERT(!reasoning_has_repeated_line_intent(text.ptr, text.len,
+                                                    &semantic_cutoff));
     buf_free(&text);
 }
 
