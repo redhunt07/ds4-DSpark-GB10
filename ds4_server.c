@@ -777,6 +777,53 @@ static void chat_msgs_free(chat_msgs *msgs) {
     memset(msgs, 0, sizeof(*msgs));
 }
 
+/* Detect a byte-exact periodic suffix in reasoning.  Degenerate model loops
+ * repeat one complete sentence (including whitespace) while still producing
+ * tokens, so an inactivity watchdog cannot distinguish them from progress. */
+static bool reasoning_has_repeated_suffix(const char *text, size_t len,
+                                          size_t *period_out) {
+    if (!text || len < 64) return false;
+    const size_t min_period = 16;
+    size_t max_period = len / 4;
+    if (max_period > 512) max_period = 512;
+    for (size_t period = min_period; period <= max_period; period++) {
+        const char *tail = text + len - period;
+        if (!memcmp(tail, tail - period, period) &&
+            !memcmp(tail, tail - 2 * period, period) &&
+            !memcmp(tail, tail - 3 * period, period))
+        {
+            if (period_out) *period_out = period;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A client may replay streamed reasoning on the next tool turn.  Collapse a
+ * detected suffix run to one copy before rendering that history, otherwise a
+ * loop we just stopped becomes a strong prompt pattern for the next request. */
+static int chat_msgs_trim_repeated_reasoning(chat_msgs *msgs) {
+    int trimmed_copies = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        char *reasoning = msgs->v[i].reasoning;
+        if (!reasoning) continue;
+        size_t len = strlen(reasoning);
+        size_t period = 0;
+        if (!reasoning_has_repeated_suffix(reasoning, len, &period)) continue;
+
+        size_t run_start = len - 4 * period;
+        while (run_start >= period &&
+               !memcmp(reasoning + run_start - period,
+                       reasoning + len - period, period))
+            run_start -= period;
+        const int copies = (int)((len - run_start) / period);
+        if (copies < 4) continue;
+        reasoning[run_start + period] = '\0';
+        trimmed_copies += copies - 1;
+    }
+    return trimmed_copies;
+}
+
 static bool tool_calls_same_single(const tool_calls *a, const tool_calls *b) {
     if (!a || !b || a->len != 1 || b->len != 1) return false;
     const tool_call *x = &a->v[0];
@@ -3132,6 +3179,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    int trimmed_reasoning = chat_msgs_trim_repeated_reasoning(&msgs);
+    if (trimmed_reasoning > 0)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: collapsed %d replayed reasoning-loop copies api=openai",
+                   trimmed_reasoning);
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     r->think_mode = select_think_mode(got_thinking, thinking_enabled,
                                       reasoning_effort, r->model, &msgs, NULL,
@@ -3356,6 +3408,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         system = NULL;
         chat_msgs_push(&msgs, msg);
     }
+    int trimmed_reasoning = chat_msgs_trim_repeated_reasoning(&msgs);
+    if (trimmed_reasoning > 0)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: collapsed %d replayed reasoning-loop copies api=anthropic",
+                   trimmed_reasoning);
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     r->think_mode = select_think_mode(got_thinking, thinking_enabled,
                                       reasoning_effort, r->model, &msgs, NULL,
@@ -4323,6 +4380,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
+    int trimmed_reasoning = chat_msgs_trim_repeated_reasoning(&msgs);
+    if (trimmed_reasoning > 0)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: collapsed %d replayed reasoning-loop copies api=responses",
+                   trimmed_reasoning);
     const char *active_tool_schemas =
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
@@ -11198,6 +11260,7 @@ decode_again:
     size_t forced_think_tool_start = SIZE_MAX;
     size_t forced_think_close_at = SIZE_MAX;
     bool eos_think_recovery_attempted = false;
+    bool reasoning_loop_recovery_attempted = false;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     /* Never let a malformed DSML envelope monopolize a session until the
@@ -11380,6 +11443,8 @@ decode_again:
         }
 
         bool stop_decode = false;
+        bool close_repeating_reasoning_after_batch = false;
+        size_t repeating_reasoning_period = 0;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
             if (token == ds4_token_bos(s->engine) ||
@@ -11476,6 +11541,18 @@ decode_again:
                 break;
             }
             free(piece);
+
+            if (thinking_gates_tool_markers && thinking.inside &&
+                !reasoning_loop_recovery_attempted &&
+                reasoning_has_repeated_suffix(text.ptr, text.len,
+                                              &repeating_reasoning_period))
+            {
+                /* Finish consuming this speculative batch before injecting a
+                 * forced close: its accepted tokens are already represented
+                 * in the live KV frontier. */
+                reasoning_loop_recovery_attempted = true;
+                close_repeating_reasoning_after_batch = true;
+            }
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking_gates_tool_markers && thinking.inside) {
@@ -11616,6 +11693,29 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+        }
+        if (close_repeating_reasoning_after_batch && !stop_decode) {
+            int recovered = chat_force_close_thinking(s, &text, &thinking,
+                                                       &completion, max_tokens,
+                                                       err, sizeof(err));
+            if (recovered > 0) {
+                tool_scan_waiting_for_think_close = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s repeated reasoning loop "
+                           "period=%zu; forced </think> after %d generated tokens",
+                           ctx_span, req_flags[0] ? " " : "", req_flags,
+                           repeating_reasoning_period, completion);
+                trace_event(s, trace_id,
+                            "repeated reasoning loop period=%zu; forced </think> "
+                            "after %d generated tokens",
+                            repeating_reasoning_period, completion);
+                continue;
+            }
+            finish = "error";
+            if (recovered == 0)
+                snprintf(err, sizeof(err),
+                         "repeated reasoning loop detected without recovery budget");
+            break;
         }
         if (stop_decode) break;
     }
@@ -16347,6 +16447,37 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_reasoning_repetition_guard(void) {
+    const char *phrase = "Let me check the colyseus.js package.\n\n";
+    buf text = {0};
+    buf_puts(&text, "I need to inspect dependencies first.\n\n");
+    for (int i = 0; i < 3; i++) buf_puts(&text, phrase);
+    size_t period = 0;
+    TEST_ASSERT(!reasoning_has_repeated_suffix(text.ptr, text.len, &period));
+    buf_puts(&text, phrase);
+    TEST_ASSERT(reasoning_has_repeated_suffix(text.ptr, text.len, &period));
+    TEST_ASSERT(period == strlen(phrase));
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {.role = xstrdup("assistant")};
+    assistant.reasoning = xstrdup(text.ptr);
+    chat_msgs_push(&msgs, assistant);
+    TEST_ASSERT(chat_msgs_trim_repeated_reasoning(&msgs) == 3);
+    TEST_ASSERT(strlen(msgs.v[0].reasoning) ==
+                strlen("I need to inspect dependencies first.\n\n") + strlen(phrase));
+    TEST_ASSERT(!reasoning_has_repeated_suffix(msgs.v[0].reasoning,
+                                               strlen(msgs.v[0].reasoning),
+                                               &period));
+    chat_msgs_free(&msgs);
+
+    buf_free(&text);
+    buf_puts(&text,
+             "Compare package.json, package-lock.json, server/package.json, "
+             "and client/package.json before changing dependencies.");
+    TEST_ASSERT(!reasoning_has_repeated_suffix(text.ptr, text.len, &period));
+    buf_free(&text);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -17545,6 +17676,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_reasoning_repetition_guard();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
