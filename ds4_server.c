@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_protocol_state.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -774,6 +775,134 @@ static void chat_msgs_free(chat_msgs *msgs) {
     for (int i = 0; i < msgs->len; i++) chat_msg_free(&msgs->v[i]);
     free(msgs->v);
     memset(msgs, 0, sizeof(*msgs));
+}
+
+static bool tool_calls_same_single(const tool_calls *a, const tool_calls *b) {
+    if (!a || !b || a->len != 1 || b->len != 1) return false;
+    const tool_call *x = &a->v[0];
+    const tool_call *y = &b->v[0];
+    return x->name && y->name && x->arguments && y->arguments &&
+           !strcmp(x->name, y->name) && !strcmp(x->arguments, y->arguments);
+}
+
+/* OpenCode waits for EOF on a shell tool's captured pipes.  PowerShell's
+ * Start-Process -NoNewWindow makes a persistent child inherit those handles;
+ * the parent command may have returned, but the tool never observes EOF.  Do
+ * not deliver such a call to the client.  Feed the precise error back through
+ * the single bounded model-owned recovery path instead. */
+static bool tool_call_has_persistent_pipe_risk(const tool_call *call,
+                                               char *detail,
+                                               size_t detail_len) {
+    if (!call || !call->name || !call->arguments) return false;
+    if (strcasecmp(call->name, "bash") &&
+        strcasecmp(call->name, "shell") &&
+        strcasecmp(call->name, "powershell"))
+        return false;
+
+    const char *args = call->arguments;
+    const bool start_process = strcasestr(args, "Start-Process") != NULL;
+    const bool same_window = strcasestr(args, "-NoNewWindow") != NULL;
+    if (!start_process || !same_window) return false;
+
+    const bool redirects_in = strcasestr(args, "-RedirectStandardInput") != NULL;
+    const bool redirects_out = strcasestr(args, "-RedirectStandardOutput") != NULL;
+    const bool redirects_err = strcasestr(args, "-RedirectStandardError") != NULL;
+    if (redirects_in && redirects_out && redirects_err) return false;
+
+    if (detail && detail_len) {
+        snprintf(detail, detail_len,
+                 "unsafe persistent PowerShell launch: Start-Process "
+                 "-NoNewWindow inherits the agent tool pipes. Retry without "
+                 "-NoNewWindow, or redirect standard input, output, and error "
+                 "with -RedirectStandardInput, -RedirectStandardOutput, and "
+                 "-RedirectStandardError. Never use Get-Content -Wait in the "
+                 "same tool call.");
+    }
+    return true;
+}
+
+static bool tool_calls_find_persistent_pipe_risk(const tool_calls *calls,
+                                                  char *detail,
+                                                  size_t detail_len) {
+    if (!calls) return false;
+    for (int i = 0; i < calls->len; i++) {
+        if (tool_call_has_persistent_pipe_risk(&calls->v[i], detail, detail_len))
+            return true;
+    }
+    return false;
+}
+
+/* Agent clients execute tools outside DS4, then replay the assistant call and
+ * its result.  Every request in a repeating A,A,A or A,B,A,B,A,B sequence is
+ * individually valid, but the overall agent never terminates.  Detect short
+ * periodic cycles in normalized history and attach a model-visible guard to
+ * the latest tool result. */
+static int chat_msgs_add_tool_loop_guard(chat_msgs *msgs) {
+    const tool_calls *recent[12] = {0};
+    int recent_len = 0;
+    int repeats = 0;
+    int period = 0;
+    int latest_tool_result = -1;
+    for (int i = msgs ? msgs->len - 1 : -1; i >= 0; i--) {
+        chat_msg *msg = &msgs->v[i];
+        if (msg->role && !strcmp(msg->role, "tool")) {
+            if (latest_tool_result < 0) latest_tool_result = i;
+            continue;
+        }
+        if (!msg->role || strcmp(msg->role, "assistant") || msg->calls.len == 0)
+            break;
+        if (msg->calls.len != 1 || recent_len == (int)(sizeof(recent) / sizeof(recent[0])))
+            break;
+        recent[recent_len++] = &msg->calls;
+    }
+
+    /* First catch a repeated latest action even when the model interleaves it
+     * with verification calls (A,B,A,A,B,A).  An exact name+arguments replay
+     * already succeeded, so a third execution cannot add information. */
+    if (recent_len > 0) {
+        for (int i = 0; i < recent_len; i++) {
+            if (tool_calls_same_single(recent[0], recent[i])) repeats++;
+        }
+        if (repeats >= 3) period = 1;
+    }
+
+    for (int p = 1; repeats < 3 && p <= 3 && p * 3 <= recent_len; p++) {
+        int occurrences = recent_len / p;
+        bool matches = true;
+        for (int i = p; i < occurrences * p; i++) {
+            if (!tool_calls_same_single(recent[i], recent[i % p])) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            period = p;
+            repeats = occurrences;
+            break;
+        }
+    }
+    if (repeats < 3 || latest_tool_result < 0) return repeats;
+
+    chat_msg *result = &msgs->v[latest_tool_result];
+    if (result->content && strstr(result->content, "Tool loop guard:"))
+        return repeats;
+    buf guarded = {0};
+    buf_puts(&guarded, result->content ? result->content : "");
+    if (period == 1) {
+        buf_printf(&guarded,
+            "\n\nTool loop guard: this identical tool call has already completed "
+            "successfully %d times. Reuse the result above. Do not invoke this "
+            "tool again; finish the task with a final response now.", repeats);
+    } else {
+        buf_printf(&guarded,
+            "\n\nTool loop guard: the last %d-tool sequence has already completed "
+            "successfully %d times. Reuse those results. Do not invoke another "
+            "tool from this cycle; finish the task with a final response now.",
+            period, repeats);
+    }
+    free(result->content);
+    result->content = buf_take(&guarded);
+    return repeats;
 }
 
 static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
@@ -2228,6 +2357,11 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
         "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+        "When a shell command starts a long-lived server, detach it and redirect stdin, stdout, and stderr away from the tool process before returning. "
+        "On POSIX use a background process with redirected streams; with PowerShell use Start-Process with explicit redirected output/error files. "
+        "In PowerShell NEVER combine Start-Process -NoNewWindow with a persistent process unless -RedirectStandardInput, -RedirectStandardOutput, and -RedirectStandardError are all present; inherited handles keep the agent tool open forever. "
+        "Do not use Get-Content -Wait when validating a persistent server. "
+        "Never leave a persistent child inheriting the tool's output pipe, because the agent will continue waiting even after this API request has completed.\n\n"
         "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
@@ -3005,6 +3139,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                                       r->think_policy, sizeof(r->think_policy));
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    int tool_loop_repeats = chat_msgs_add_tool_loop_guard(&msgs);
+    if (tool_loop_repeats >= 3) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: agent tool loop guard armed repeats=%d api=openai tools=disabled",
+                   tool_loop_repeats);
+        r->has_tools = false;
+    }
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -3232,6 +3373,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    int tool_loop_repeats = chat_msgs_add_tool_loop_guard(&msgs);
+    if (tool_loop_repeats >= 3) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: agent tool loop guard armed repeats=%d api=anthropic tools=disabled",
+                   tool_loop_repeats);
+        r->has_tools = false;
+    }
     anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
@@ -4197,6 +4345,14 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    int tool_loop_repeats = chat_msgs_add_tool_loop_guard(&msgs);
+    if (tool_loop_repeats >= 3) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: agent tool loop guard armed repeats=%d api=responses tools=disabled",
+                   tool_loop_repeats);
+        r->has_tools = false;
+        active_tool_schemas = NULL;
+    }
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
@@ -4995,7 +5151,29 @@ static bool parse_generated_message_for_response(const char *text,
                                                 require_thinking_closed,
                                                 content_out, reasoning_out,
                                                 calls);
-    if (parsed_ok) return true;
+    if (parsed_ok) {
+        /* The client's tool list is the protocol authority.  Models can still
+         * emit a DSML-looking block while answering a no-tools request (most
+         * notably an agent's internal summary/compaction turn).  Returning it
+         * as tool_calls violates the OpenAI contract and clients correctly
+         * reject it.  Keep the useful pre-call reasoning as assistant content
+         * when no visible content was produced, and never expose executable
+         * calls that the request did not authorize. */
+        if (!has_tools && calls->len > 0) {
+            if ((!*content_out || !(*content_out)[0]) &&
+                *reasoning_out && (*reasoning_out)[0])
+            {
+                free(*content_out);
+                *content_out = xstrdup(*reasoning_out);
+            }
+            free(*reasoning_out);
+            *reasoning_out = NULL;
+            tool_calls_free(calls);
+            if (finish_io && *finish_io && !strcmp(*finish_io, "tool_calls"))
+                *finish_io = "stop";
+        }
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -5363,6 +5541,7 @@ typedef struct {
     openai_stream_mode mode;
     size_t emit_pos;
     bool active;
+    bool buffer_tools;
     bool checked_think_prefix;
     bool sent_reasoning;
     bool sent_content;
@@ -5372,6 +5551,7 @@ typedef struct {
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
+    st->buffer_tools = env_flag_on("DS4_SERVER_BUFFER_TOOL_STREAM");
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
 }
 
@@ -5740,6 +5920,15 @@ static bool dsml_decode_state_is_tool(dsml_decode_state state) {
 
 static bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
     return state == DSML_DECODE_STRING_BODY || state == DSML_DECODE_JSON_STRING;
+}
+
+/* Count only tokens emitted after entering the executable DSML envelope.  The
+ * completion can contain arbitrarily long reasoning before the first tool
+ * marker, so using the total completion as the malformed-envelope budget
+ * truncates otherwise valid calls at different (and sometimes tiny) sizes. */
+static int dsml_tokens_since_start(int completion, int start_completion) {
+    if (start_completion < 0 || completion < start_completion) return 0;
+    return completion - start_completion;
 }
 
 static void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
@@ -6176,15 +6365,26 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
+        } else if (tool) {
+            limit = (size_t)(tool - raw);
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+            /* Hold both a partial </think> and partial tool marker.  Otherwise
+             * clients briefly display `<tool_calls>` as reasoning before the
+             * server recognizes an implicit think-to-tool transition. */
+            if (r->has_tools) {
+                limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                                true, false);
+            } else {
+                const size_t hold = strlen("</think>") - 1;
+                limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+                limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+            }
         }
 
         if (limit > st->emit_pos) {
@@ -6198,6 +6398,16 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
             st->mode = OPENAI_STREAM_TEXT;
+        } else if (tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            if (st->buffer_tools) {
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            } else if (openai_tool_stream_init(&st->tool, raw, raw_len,
+                                                st->emit_pos)) {
+                st->mode = OPENAI_STREAM_TOOL;
+            } else {
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
             return true;
@@ -6221,7 +6431,12 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (st->buffer_tools) {
+                /* Do not put irreversible partial tool JSON on the wire.  The
+                 * final parser emits one complete delta after the DSML block
+                 * closes; malformed calls can then be retried safely. */
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            } else if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -8069,6 +8284,12 @@ struct server {
     bool stopping;
     int clients;
     uint64_t seq;
+    uint64_t request_seq;
+    bool worker_busy;
+    ds4_protocol_state active_protocol;
+    uint64_t completed_requests;
+    uint64_t failed_requests;
+    uint64_t cancelled_requests;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -8089,11 +8310,56 @@ struct server {
 struct job {
     int fd;
     request req;
+    ds4_protocol_state protocol;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static bool server_protocol_transition(server *s, job *j,
+                                       ds4_protocol_phase phase) {
+    bool ok;
+    pthread_mutex_lock(&s->mu);
+    ok = ds4_protocol_transition(&j->protocol, phase, now_sec());
+    if (ok) s->active_protocol = j->protocol;
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
+static bool server_protocol_begin_recovery(server *s, job *j) {
+    bool ok;
+    pthread_mutex_lock(&s->mu);
+    ok = ds4_protocol_begin_recovery(&j->protocol, now_sec());
+    if (ok) s->active_protocol = j->protocol;
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
+static void server_protocol_progress(server *s, job *j,
+                                     int prompt_tokens,
+                                     int completion_tokens) {
+    pthread_mutex_lock(&s->mu);
+    ds4_protocol_progress(&j->protocol, prompt_tokens, completion_tokens,
+                          now_sec());
+    s->active_protocol = j->protocol;
+    pthread_mutex_unlock(&s->mu);
+}
+
+static bool server_protocol_finish(server *s, job *j,
+                                   ds4_protocol_phase phase) {
+    bool ok;
+    pthread_mutex_lock(&s->mu);
+    ok = ds4_protocol_finish(&j->protocol, phase, now_sec());
+    if (ok) {
+        s->active_protocol = j->protocol;
+        if (phase == DS4_PROTOCOL_COMPLETE) s->completed_requests++;
+        else if (phase == DS4_PROTOCOL_CANCELLED) s->cancelled_requests++;
+        else s->failed_requests++;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -8972,11 +9238,6 @@ static bool byte_prefix_match(const char *text, size_t text_len,
 }
 
 
-static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
-    ds4_kvstore_tokens_copy_prefix(dst, src, n);
-}
-
-
 static void build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
@@ -8987,6 +9248,11 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
+    return ds4_kvstore_continued_store_target(kc, live_tokens);
+}
+
+#ifdef DS4_SERVER_TEST
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -8998,10 +9264,16 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
-
-static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
-    return ds4_kvstore_continued_store_target(kc, live_tokens);
+static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
+    return ds4_kvstore_suppress_continued_store(kc, tokens);
 }
+
+static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
+                                                   int old_tokens,
+                                                   int suppressed_tokens) {
+    ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
+}
+#endif
 
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
@@ -9115,16 +9387,6 @@ static void kv_cache_store_current(server *s, const char *reason) {
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
     ds4_kvstore_note_store(kc, tokens);
-}
-
-static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
-    return ds4_kvstore_suppress_continued_store(kc, tokens);
-}
-
-static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
-                                                  int old_tokens,
-                                                  int suppressed_tokens) {
-    ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
 static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
@@ -9690,6 +9952,7 @@ static void trace_finish(
 
 typedef struct {
     server *srv;
+    job *request_job;
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
@@ -9940,33 +10203,9 @@ static char *normalize_forced_think_tool_close(const char *text,
     return buf_take(&out);
 }
 
-static char *rendered_chat_system_region(const char *prompt_text) {
-    if (!prompt_text) return xstrdup("");
-    const char *p = prompt_text;
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    const size_t bos_len = strlen(bos);
-    if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = ds4_think_max_prefix();
-    const size_t max_prefix_len = strlen(max_prefix);
-    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
-        p += max_prefix_len;
-    }
-    while (*p && isspace((unsigned char)*p)) p++;
-
-    const char *user = strstr(p, "<｜User｜>");
-    const char *assistant = strstr(p, "<｜Assistant｜>");
-    const char *end = NULL;
-    if (user && assistant) end = user < assistant ? user : assistant;
-    else end = user ? user : assistant;
-    if (!end) end = p + strlen(p);
-    while (end > p && isspace((unsigned char)end[-1])) end--;
-    return xstrndup(p, (size_t)(end - p));
-}
-
 static char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
-    char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
     buf tool_error = {0};
     buf_puts(&tool_error, "Tool error: invalid DSML tool call");
     if (detail && detail[0]) {
@@ -9976,10 +10215,6 @@ static char *build_invalid_dsml_tool_error_suffix(const request *r,
     buf_puts(&tool_error,
              "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
              "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
-    if (system && system[0]) {
-        buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
-        buf_puts(&tool_error, system);
-    }
 
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
@@ -9990,7 +10225,6 @@ static char *build_invalid_dsml_tool_error_suffix(const request *r,
     buf_puts(&suffix, "</tool_result><｜Assistant｜>");
     buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
 
-    free(system);
     buf_free(&tool_error);
     return buf_take(&suffix);
 }
@@ -10006,6 +10240,20 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
         return false;
     }
 
+    /* Recovery must stay a small suffix-only operation.  This hard gate keeps
+     * an accidental prompt reminder or transcript copy from turning one bad
+     * tool call into another full-context prefill. */
+    ds4_tokens suffix_tokens = {0};
+    ds4_tokenize_rendered_chat(s->engine, suffix, &suffix_tokens);
+    if (suffix_tokens.len <= 0 || suffix_tokens.len > 192) {
+        if (err && errlen)
+            snprintf(err, errlen, "recovery suffix exceeds 192-token budget (%d)",
+                     suffix_tokens.len);
+        ds4_tokens_free(&suffix_tokens);
+        return false;
+    }
+    ds4_tokens_free(&suffix_tokens);
+
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(s->session);
@@ -10013,6 +10261,13 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
     if (ok && tokens_appended) {
         int delta = ds4_session_pos(s->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
+        if (*tokens_appended > 192) {
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "recovery appended %d tokens, exceeds 192-token budget",
+                         *tokens_appended);
+            ok = false;
+        }
     }
     ds4_tokens_free(&target);
     return ok;
@@ -10076,6 +10331,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (!is_chunk && !is_display) return;
 
     double now = now_sec();
+    if (p->srv && p->request_job)
+        server_protocol_progress(p->srv, p->request_job, current, 0);
     if (p->deadline > 0.0 && now >= p->deadline) {
         p->stream_failed = true;
         server_log(DS4_LOG_WARNING,
@@ -10084,6 +10341,11 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                    p->ctx, current, total);
         return;
     }
+    /* This is an inactivity deadline, not a wall-clock request limit.  Long
+     * prefills are allowed to run for as long as they keep crossing safe
+     * progress frontiers. */
+    if (p->deadline > 0.0)
+        p->deadline = now + server_job_timeout_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
@@ -10332,10 +10594,23 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
-        if (loaded == 0) ds4_session_invalidate(s->session);
+        if (loaded == 0) {
+            /* Never rebuild a complete prompt from token zero as recovery.
+             * Preserve the valid live checkpoint; the next request can
+             * deterministically truncate it to its exact common prefix. */
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: tool checkpoint canonicalization deferred ctx=%s common=%d live=%d target=%d reason=no-stable-checkpoint",
+                       ctx, common, live_len, canonical.len);
+            trace_event(s, trace_id,
+                        "tool checkpoint canonicalization deferred: no stable checkpoint common=%d live=%d canonical=%d",
+                        common, live_len, canonical.len);
+            ds4_tokens_free(&effective);
+            free(path);
+            goto done;
+        }
 
         char sync_err[160] = {0};
-        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        const ds4_tokens *sync_prompt = &effective;
         char rebuild_ctx[48];
         request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
         int replay_tokens = sync_prompt->len - loaded;
@@ -10344,7 +10619,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
         int discarded_live_tokens = live_len - common;
         if (discarded_live_tokens < 0) discarded_live_tokens = 0;
-        const char *source = loaded > 0 ? "disk" : "full";
+        const char *source = "disk";
         const double rebuild_t0 = now_sec();
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
@@ -10384,21 +10659,12 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
-            if (loaded > 0) {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
-                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
-                            common, live_len, canonical.len, loaded, path ? path : "");
-            } else {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
-                            "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
-                            common, live_len, canonical.len, err);
-            }
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
+                       rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
+            trace_event(s, trace_id,
+                        "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
+                        common, live_len, canonical.len, loaded, path ? path : "");
         } else {
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
@@ -10440,11 +10706,10 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
  * hits we build a fresh effective prompt from the checkpoint's exact token
  * history plus a newly tokenized string suffix; the canonical full-prompt
- * tokens are not sliced because BPE may merge across the byte boundary.  Cold
- * prompt caching is handled before generation: if the stable checkpoint is
- * shorter than the full prompt, we prefill to that boundary, store it, and
- * immediately continue to the real prompt.  The live graph therefore always
- * moves forward. */
+ * tokens are not sliced because BPE may merge across the byte boundary.  New
+ * cold prompts are synchronized in one pass and cached at
+ * their complete frontier; splitting at a cache boundary can leave a short
+ * token-by-token suffix with invalid next-token logits on CUDA. */
 static char *steering_resolve_profile(server *s, const char *name, char *err, size_t errlen);
 
 /* Steering strength tiers exposed in model ids: "<base>:<profile>[:<tier>]".
@@ -10598,6 +10863,12 @@ static void generate_job(server *s, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
+        /* A token common-prefix alone is not a reusable graph checkpoint: the
+         * live backend also contains raw/compressed KV and compressor state
+         * for its sampled tail.  Use memory only when the complete live
+         * checkpoint is a prefix.  Otherwise let the disk-cache chooser load
+         * a stable frontier instead of falsely reporting a warm suffix while
+         * ds4_session_sync() performs a cold rebuild from token zero. */
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
@@ -10665,13 +10936,14 @@ static void generate_job(server *s, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
-    const double job_deadline = t0 + server_job_timeout_sec();
+    double job_deadline = t0 + server_job_timeout_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
         .srv = s,
+        .request_job = j,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
@@ -10736,79 +11008,13 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
-    int cold_store_len = 0;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
-    }
-    int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
-        /* A cold checkpoint can land exactly on the continued-checkpoint
-         * frontier.  The prefill progress callback would then write the same
-         * prefix as "continued" while we are intentionally stopping there to
-         * write it as "cold".  Mark the frontier as already handled before the
-         * sync reaches it; if the cold write fails, restore the old schedule so
-         * a later continued write can still try. */
-        suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
-    }
-
-    if (s->kv.enabled &&
-        cold_store_len >= s->kv.opt.min_tokens &&
-        cold_store_len < prompt_for_sync->len)
-    {
-        ds4_tokens prefix = {0};
-        tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        int prefix_sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
-        if (prefix_sync_rc != 0) {
-            ds4_tokens_free(&prefix);
-            ds4_tokens_free(&effective_prompt);
-            ds4_session_set_cancel(s->session, NULL, NULL);
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            if (prefix_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
-                kv_cache_discard_failed_disk_entry(s, disk_cache_path);
-            free(disk_cache_path);
-            if (prefix_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: %s ctx=%s prefill cancelled at safe KV frontier",
-                           j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
-                trace_event(s, trace_id, "prefill cancelled at safe KV frontier");
-            } else {
-                trace_event(s, trace_id, "prefill failed: %s", err);
-                send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
-            }
-            return;
-        }
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            suppressed_continued_last = -1;
-        }
-        ds4_tokens_free(&prefix);
-    }
-
     int prompt_sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+    job_deadline = progress.deadline;
     ds4_session_set_cancel(s->session, NULL, NULL);
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                              cold_store_len);
         if (prompt_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
@@ -10817,6 +11023,9 @@ static void generate_job(server *s, job *j) {
                        "ds4-server: %s ctx=%s prefill cancelled at safe KV frontier",
                        j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
             trace_event(s, trace_id, "prefill cancelled at safe KV frontier");
+            server_protocol_finish(s, j,
+                (g_stop_requested || progress.stream_failed) ?
+                    DS4_PROTOCOL_CANCELLED : DS4_PROTOCOL_ERROR);
         } else {
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
@@ -10869,6 +11078,8 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    server_protocol_progress(s, j, prompt_tokens, 0);
+    server_protocol_transition(s, j, DS4_PROTOCOL_DECODE);
     if (getenv("DS4_PROMPT_DIAGNOSTICS") != NULL) {
         const char *prompt_text = j->req.prompt_text ? j->req.prompt_text : "";
         const char *assistant = "<｜Assistant｜>";
@@ -10884,15 +11095,6 @@ static void generate_job(server *s, job *j) {
                    ds4_debug_count_text(prompt_text, "<｜begin▁of▁sentence｜>"),
                    ds4_debug_count_text(prompt_text, assistant), assistant_suffix ? 1 : 0,
                    j->req.has_tools ? 1 : 0);
-    }
-    if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-        }
     }
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
@@ -10962,11 +11164,12 @@ static void generate_job(server *s, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
-    bool first_tool_frontier_rebuild_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
 decode_again:
     ;
+    if (j->protocol.phase == DS4_PROTOCOL_RECOVERY)
+        server_protocol_transition(s, j, DS4_PROTOCOL_DECODE);
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -10998,10 +11201,10 @@ decode_again:
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     /* Never let a malformed DSML envelope monopolize a session until the
-     * global watchdog.  A valid tool call normally closes within a few
-     * hundred tokens; this guard is configurable for unusually large JSON
-     * arguments and turns the failure into a clean client-visible error. */
-    int dsml_unterminated_limit = 4096;
+     * global watchdog.  Code-agent write/edit calls legitimately carry whole
+     * source files, so this is a per-envelope budget (not a total-completion
+     * budget) and must be large enough for those payloads. */
+    int dsml_unterminated_limit = 16384;
     const char *dsml_limit_env = getenv("DS4_SERVER_DSML_UNTERMINATED_MAX_TOKENS");
     if (dsml_limit_env && dsml_limit_env[0]) {
         char *limit_end = NULL;
@@ -11011,6 +11214,7 @@ decode_again:
     }
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    int dsml_start_completion = -1;
 
     while (!g_stop_requested && now_sec() < job_deadline && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
@@ -11080,63 +11284,6 @@ decode_again:
                            "ds4-server: chat ctx=%s recovered first EOS=%d to=%d for tool request",
                            ctx_span, token, recovered);
                 token = recovered;
-            }
-        }
-        if (completion == 0 && j->req.kind == REQ_CHAT && j->req.has_tools) {
-            /* A literal `!` at the first tool-continuation position is not
-             * repaired by choosing another token from the same logits: that
-             * would hide a bad live-KV frontier. Rebuild from the complete
-             * client prompt once, then retry the turn. If the full prompt also
-             * yields `!`, report it as a real model/runtime failure. */
-            size_t first_len = 0;
-            char *first_piece = ds4_token_text(s->engine, token, &first_len);
-            const bool placeholder = first_piece && first_len == 1 && first_piece[0] == '!';
-            free(first_piece);
-            if (placeholder) {
-                if (!first_tool_frontier_rebuild_attempted) {
-                    first_tool_frontier_rebuild_attempted = true;
-                    ds4_session_invalidate(s->session);
-                    char rebuild_err[160] = {0};
-                    if (ds4_session_sync(s->session, &j->req.prompt,
-                                         rebuild_err, sizeof(rebuild_err)) == 0) {
-                        cached = 0;
-                        cache_source = "first-tool-frontier-rebuild";
-                        prompt_for_sync = &j->req.prompt;
-                        prompt_tokens = j->req.prompt.len;
-                        j->req.cache_read_tokens = 0;
-                        j->req.cache_write_tokens = prompt_tokens;
-                        responses_live_continuation = false;
-                        anthropic_live_continuation = false;
-                        thinking_live_continuation = false;
-                        responses_live_clear(s);
-                        anthropic_live_clear(s);
-                        request_ctx_span(ctx_span, sizeof(ctx_span), 0, prompt_tokens);
-                        trace_event(s, trace_id,
-                                    "first tool token was !; rebuilt complete prompt tokens=%d; retrying",
-                                    prompt_tokens);
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s first tool token was !; rebuilt complete prompt and retrying",
-                                   ctx_span);
-                        buf_free(&text);
-                        goto decode_again;
-                    }
-                    finish = "error";
-                    snprintf(err, sizeof(err),
-                             "tool continuation frontier invalid and full-prompt rebuild failed: %s",
-                             rebuild_err[0] ? rebuild_err : "unknown error");
-                    trace_event(s, trace_id, "first tool placeholder rebuild failed: %s", err);
-                } else {
-                    finish = "error";
-                    snprintf(err, sizeof(err),
-                             "model returned invalid first tool token ! after full-prompt rebuild");
-                    trace_event(s, trace_id, "invalid first tool token ! persisted after rebuild");
-                }
-                if (strcmp(finish, "error") == 0) {
-                    server_log(DS4_LOG_WARNING,
-                               "ds4-server: chat ctx=%s invalid first tool token ! finish=error",
-                               ctx_span);
-                    break;
-                }
             }
         }
         if (token == ds4_token_eos(s->engine)) {
@@ -11259,6 +11406,10 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            /* Decode made observable progress: extend the inactivity
+             * watchdog.  There is deliberately no total generation limit. */
+            job_deadline = now_sec() + server_job_timeout_sec();
+            server_protocol_progress(s, j, prompt_tokens, completion);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -11398,6 +11549,7 @@ decode_again:
                                     completion);
                     }
                     if (saw_tool_start && !old_start) {
+                        dsml_start_completion = completion;
                         trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
                     }
                     if (saw_tool_end && !old_end) {
@@ -11412,25 +11564,31 @@ decode_again:
                                     completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
                         next_tool_progress += 128;
                     }
+                    const int dsml_tokens =
+                        dsml_tokens_since_start(completion, dsml_start_completion);
                     if (saw_tool_start && !saw_tool_end &&
-                        completion >= dsml_unterminated_limit) {
-                        finish = "error";
-                        snprintf(err, sizeof(err),
-                                 "unterminated tool call after %d tokens",
-                                 completion);
+                        dsml_tokens >= dsml_unterminated_limit) {
+                        finish = "stop";
                         server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s aborting unterminated DSML after %d tokens",
+                                   "ds4-server: chat ctx=%s%s%s aborting unterminated DSML "
+                                   "after %d tool tokens (%d total tokens)",
                                    ctx_span, req_flags[0] ? " " : "", req_flags,
-                                   completion);
+                                   dsml_tokens, completion);
                         trace_event(s, trace_id,
-                                    "aborted unterminated DSML after %d tokens",
-                                    completion);
+                                    "aborted unterminated DSML after %d tool tokens (%d total tokens)",
+                                    dsml_tokens, completion);
                         stop_decode = true;
                     }
                 }
             }
 
+            /* A speculative batch may contain several accepted tokens.  Once
+             * any protocol/stream guard requests a stop, do not append the
+             * remainder of that batch past the stable terminal frontier. */
+            if (stop_decode) break;
+
             if (completion >= next_decode_log) {
+                server_protocol_progress(s, j, prompt_tokens, completion);
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
                                     j->req.has_tools,
@@ -11514,7 +11672,8 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if ((!j->req.stream || openai_live_chat) && !dsml_recovery_attempted &&
+                server_protocol_begin_recovery(s, j)) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -11540,6 +11699,10 @@ decode_again:
                     trace_event(s, trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
+                    if (openai_live_chat) {
+                        openai_stream_free(&openai_live);
+                        openai_stream_start(&j->req, &openai_live);
+                    }
                     buf_free(&repaired);
                     buf_free(&text);
                     goto decode_again;
@@ -11613,7 +11776,8 @@ decode_again:
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if ((!j->req.stream || openai_live_chat) && !dsml_recovery_attempted &&
+                server_protocol_begin_recovery(s, j)) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -11640,6 +11804,10 @@ decode_again:
                     trace_event(s, trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
+                    if (openai_live_chat) {
+                        openai_stream_free(&openai_live);
+                        openai_stream_start(&j->req, &openai_live);
+                    }
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
@@ -11691,6 +11859,72 @@ decode_again:
                             "invalid tool call returned as assistant text finish=%s",
                             final_finish);
             }
+        }
+        char pipe_risk_detail[512] = {0};
+        if (parsed_calls.len &&
+            tool_calls_find_persistent_pipe_risk(&parsed_calls,
+                                                  pipe_risk_detail,
+                                                  sizeof(pipe_risk_detail)))
+        {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s blocked tool call with persistent inherited-pipe risk",
+                       ctx_span, req_flags[0] ? " " : "", req_flags);
+            trace_event(s, trace_id,
+                        "blocked tool call with persistent inherited-pipe risk");
+            if ((!j->req.stream || openai_live_chat) && !dsml_recovery_attempted &&
+                server_protocol_begin_recovery(s, j))
+            {
+                int recovery_tokens = 0;
+                char recovery_err[160] = {0};
+                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                                                pipe_risk_detail,
+                                                &recovery_tokens,
+                                                recovery_err,
+                                                sizeof(recovery_err)))
+                {
+                    dsml_recovery_attempted = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s unsafe persistent launch rejected; "
+                               "tool-error continuation appended %d tokens",
+                               ctx_span, req_flags[0] ? " " : "", req_flags,
+                               recovery_tokens);
+                    trace_event(s, trace_id,
+                                "unsafe persistent launch recovery appended %d tokens",
+                                recovery_tokens);
+                    if (openai_live_chat) {
+                        openai_stream_free(&openai_live);
+                        openai_stream_start(&j->req, &openai_live);
+                    }
+                    free(parsed_content);
+                    free(parsed_reasoning);
+                    tool_calls_free(&parsed_calls);
+                    buf_free(&text);
+                    goto decode_again;
+                }
+                snprintf(err, sizeof(err),
+                         "unsafe persistent launch recovery failed: %s",
+                         recovery_err[0] ? recovery_err : "unknown error");
+            } else {
+                snprintf(err, sizeof(err), "%s", pipe_risk_detail);
+            }
+            tool_calls_free(&parsed_calls);
+            free(parsed_content);
+            free(parsed_reasoning);
+            parsed_content = xstrdup("");
+            parsed_reasoning = NULL;
+            final_finish = "error";
+        }
+        if (parsed_calls.len && !j->req.has_tools) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: request=%llu rejected %d tool calls because tools are disabled",
+                       (unsigned long long)j->protocol.request_id,
+                       parsed_calls.len);
+            tool_calls_free(&parsed_calls);
+            free(parsed_content);
+            parsed_content = xstrdup("");
+            final_finish = "error";
+            snprintf(err, sizeof(err),
+                     "model produced a tool call while tools are disabled");
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
@@ -11783,8 +12017,10 @@ decode_again:
         thinking_live_clear(s);
     }
 
+    server_protocol_progress(s, j, prompt_tokens, completion);
+    server_protocol_transition(s, j, DS4_PROTOCOL_SERIALIZE);
+    bool response_ok = true;
     if (j->req.stream) {
-        bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -11826,19 +12062,19 @@ decode_again:
                        req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
+        response_ok = anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
+        response_ok = responses_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
+        response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
@@ -11911,6 +12147,10 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+    server_protocol_finish(s, j,
+        g_stop_requested ? DS4_PROTOCOL_CANCELLED :
+        (!response_ok || !strcmp(final_finish, "error") ?
+            DS4_PROTOCOL_ERROR : DS4_PROTOCOL_COMPLETE));
 }
 
 static bool enqueue(server *s, job *j) {
@@ -11919,6 +12159,8 @@ static bool enqueue(server *s, job *j) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
+    ds4_protocol_state_init(&j->protocol, ++s->request_seq,
+                            j->req.has_tools, now_sec());
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
     pthread_cond_signal(&s->cv);
@@ -12082,15 +12324,37 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         const double started = now_sec();
+        pthread_mutex_lock(&s->mu);
+        s->worker_busy = true;
+        s->active_protocol = j->protocol;
+        pthread_mutex_unlock(&s->mu);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: worker start kind=%d fd=%d queued=%s timeout=%.0fs",
+                   "ds4-server: request=%llu worker start kind=%d fd=%d queued=%s timeout=%.0fs",
+                   (unsigned long long)j->protocol.request_id,
                    (int)j->req.kind, j->fd, j->req.stream ? "stream" : "buffered",
                    server_job_timeout_sec());
-        if (j->req.kind == REQ_STEERING_CONTROL) handle_steering_control(s, j);
-        else generate_job(s, j);
+        if (j->req.kind == REQ_STEERING_CONTROL) {
+            server_protocol_transition(s, j, DS4_PROTOCOL_SERIALIZE);
+            handle_steering_control(s, j);
+            server_protocol_finish(s, j, DS4_PROTOCOL_COMPLETE);
+        } else {
+            server_protocol_transition(s, j, DS4_PROTOCOL_PREFILL);
+            generate_job(s, j);
+        }
+        if (!j->protocol.terminal) {
+            server_protocol_finish(s, j,
+                g_stop_requested ? DS4_PROTOCOL_CANCELLED : DS4_PROTOCOL_ERROR);
+        }
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: worker finish kind=%d fd=%d elapsed=%.3fs",
-                   (int)j->req.kind, j->fd, now_sec() - started);
+                   "ds4-server: request=%llu worker finish kind=%d fd=%d phase=%s elapsed=%.3fs",
+                   (unsigned long long)j->protocol.request_id,
+                   (int)j->req.kind, j->fd,
+                   ds4_protocol_phase_name(j->protocol.phase),
+                   now_sec() - started);
+        pthread_mutex_lock(&s->mu);
+        s->worker_busy = false;
+        s->active_protocol = j->protocol;
+        pthread_mutex_unlock(&s->mu);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12278,6 +12542,51 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_health(server *s, int fd) {
+    ds4_protocol_state active;
+    bool busy;
+    int clients;
+    int queued = 0;
+    uint64_t complete, failed, cancelled;
+    pthread_mutex_lock(&s->mu);
+    active = s->active_protocol;
+    busy = s->worker_busy;
+    clients = s->clients;
+    for (job *j = s->head; j; j = j->next) queued++;
+    complete = s->completed_requests;
+    failed = s->failed_requests;
+    cancelled = s->cancelled_requests;
+    pthread_mutex_unlock(&s->mu);
+
+    double idle = active.last_progress_at > 0.0 ?
+        now_sec() - active.last_progress_at : 0.0;
+    if (idle < 0.0) idle = 0.0;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"status\":\"ok\",\"model_loaded\":true,"
+        "\"worker_busy\":%s,\"clients\":%d,\"queued\":%d,"
+        "\"completed_requests\":%llu,\"failed_requests\":%llu,"
+        "\"cancelled_requests\":%llu,\"active\":{"
+        "\"request_id\":%llu,\"phase\":",
+        busy ? "true" : "false", clients, queued,
+        (unsigned long long)complete, (unsigned long long)failed,
+        (unsigned long long)cancelled,
+        (unsigned long long)active.request_id);
+    json_escape(&b, ds4_protocol_phase_name(active.phase));
+    buf_printf(&b,
+        ",\"terminal\":%s,\"tools_enabled\":%s,"
+        "\"recovery_attempted\":%s,\"prompt_tokens\":%d,"
+        "\"completion_tokens\":%d,\"idle_seconds\":%.3f}}\n",
+        active.terminal ? "true" : "false",
+        active.tools_enabled ? "true" : "false",
+        active.recovery_attempted ? "true" : "false",
+        active.prompt_tokens, active.completion_tokens, idle);
+    bool ok = http_response(fd, s->enable_cors, 200,
+                            "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12307,6 +12616,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/healthz")) {
+        send_health(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -14281,6 +14595,7 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
     const char *user_m = strstr(prompt, "<｜User｜>");
     TEST_ASSERT(tools && client && user_m);
+    TEST_ASSERT(strstr(prompt, "persistent child inheriting the tool's output pipe") != NULL);
     TEST_ASSERT(tools  < client);
     TEST_ASSERT(client < user_m);
     free(prompt);
@@ -14658,7 +14973,46 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     tool_calls_free(&calls);
 }
 
-static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
+static void test_no_tools_request_never_returns_dsml_calls(void) {
+    const char *generated =
+        "<think>Compact summary of the completed work.</think>"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"filePath\" string=\"true\">game.js"
+        DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "tool_calls";
+    bool recovered = false;
+
+    TEST_ASSERT(parse_generated_message_for_response(generated,
+                                                       false,
+                                                       false,
+                                                       false,
+                                                       &finish,
+                                                       err,
+                                                       sizeof(err),
+                                                       &content,
+                                                       &reasoning,
+                                                       &calls,
+                                                       &recovered));
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    TEST_ASSERT(content && strstr(content, "Compact summary") != NULL);
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(!recovered);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_invalid_dsml_tool_error_suffix_is_bounded(void) {
     request r = {0};
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(
@@ -14672,12 +15026,135 @@ static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     TEST_ASSERT(strstr(suffix, "</think><｜end▁of▁sentence｜><｜User｜><tool_result>") == suffix);
     TEST_ASSERT(strstr(suffix, "Tool error: invalid DSML tool call: missing invoke name") != NULL);
     TEST_ASSERT(strstr(suffix, "The previous assistant output was not executed") != NULL);
-    TEST_ASSERT(strstr(suffix, "System prompt reminder:\n## Tools\nschema\n\nSystem rule") != NULL);
+    TEST_ASSERT(strstr(suffix, "System prompt reminder:") == NULL);
+    TEST_ASSERT(strstr(suffix, "## Tools") == NULL);
     TEST_ASSERT(strstr(suffix, "<｜User｜>Hi") == NULL);
     TEST_ASSERT(strstr(suffix, "</tool_result><｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strlen(suffix) < 1024);
 
     free(suffix);
     free(r.prompt_text);
+}
+
+static void test_protocol_lifecycle_stress(void) {
+    for (uint64_t i = 1; i <= 1000; i++) {
+        ds4_protocol_state state;
+        ds4_protocol_state_init(&state, i, (i & 1) != 0, 1.0);
+        TEST_ASSERT(state.phase == DS4_PROTOCOL_QUEUED);
+        TEST_ASSERT(!state.terminal);
+        TEST_ASSERT(!ds4_protocol_transition(&state, DS4_PROTOCOL_DECODE, 2.0));
+        TEST_ASSERT(ds4_protocol_transition(&state, DS4_PROTOCOL_PREFILL, 2.0));
+        ds4_protocol_progress(&state, 120000, 0, 3.0);
+        TEST_ASSERT(ds4_protocol_transition(&state, DS4_PROTOCOL_DECODE, 4.0));
+        ds4_protocol_progress(&state, 120000, 64, 5.0);
+        TEST_ASSERT(ds4_protocol_begin_recovery(&state, 6.0));
+        TEST_ASSERT(!ds4_protocol_begin_recovery(&state, 7.0));
+        TEST_ASSERT(ds4_protocol_transition(&state, DS4_PROTOCOL_DECODE, 8.0));
+        TEST_ASSERT(ds4_protocol_transition(&state, DS4_PROTOCOL_SERIALIZE, 9.0));
+        TEST_ASSERT(ds4_protocol_finish(&state, DS4_PROTOCOL_COMPLETE, 10.0));
+        TEST_ASSERT(state.terminal);
+        TEST_ASSERT(!ds4_protocol_finish(&state, DS4_PROTOCOL_ERROR, 11.0));
+        TEST_ASSERT(!ds4_protocol_transition(&state, DS4_PROTOCOL_DECODE, 12.0));
+        TEST_ASSERT(!strcmp(ds4_protocol_phase_name(state.phase), "complete"));
+    }
+}
+
+static void test_identical_tool_loop_adds_guard(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run tests");
+    chat_msgs_push(&msgs, user);
+    for (int i = 0; i < 3; i++) {
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        tool_call call = {0};
+        call.name = xstrdup("bash");
+        call.arguments = xstrdup("{\"command\":\"npm test\"}");
+        tool_calls_push(&assistant.calls, call);
+        chat_msgs_push(&msgs, assistant);
+        chat_msg tool = {0};
+        tool.role = xstrdup("tool");
+        tool.content = xstrdup("exit 0");
+        chat_msgs_push(&msgs, tool);
+    }
+    TEST_ASSERT(chat_msgs_add_tool_loop_guard(&msgs) == 3);
+    TEST_ASSERT(strstr(msgs.v[msgs.len - 1].content,
+                       "finish the task with a final response now") != NULL);
+    /* Running normalization again must remain bounded and replace no history. */
+    TEST_ASSERT(chat_msgs_add_tool_loop_guard(&msgs) == 3);
+    TEST_ASSERT(strlen(msgs.v[msgs.len - 1].content) < 1024);
+    chat_msgs_free(&msgs);
+}
+
+static void test_alternating_tool_loop_adds_guard(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("start and verify")};
+    chat_msgs_push(&msgs, user);
+    for (int i = 0; i < 6; i++) {
+        const char *command = (i % 2 == 0) ?
+            "node server.js </dev/null >/tmp/out 2>/tmp/err &" :
+            "sleep 2; cat /tmp/out";
+        chat_msg assistant = {.role = xstrdup("assistant")};
+        tool_call call = {
+            .name = xstrdup("bash"),
+            .arguments = NULL,
+        };
+        buf args = {0};
+        buf_puts(&args, "{\"command\":\"");
+        buf_puts(&args, command);
+        buf_puts(&args, "\"}");
+        call.arguments = buf_take(&args);
+        tool_calls_push(&assistant.calls, call);
+        chat_msgs_push(&msgs, assistant);
+        chat_msg tool = {.role = xstrdup("tool"), .content = xstrdup("exit 0")};
+        chat_msgs_push(&msgs, tool);
+    }
+    TEST_ASSERT(chat_msgs_add_tool_loop_guard(&msgs) == 3);
+    TEST_ASSERT(strstr(msgs.v[msgs.len - 1].content,
+                       "already completed successfully 3 times") != NULL);
+    TEST_ASSERT(strstr(msgs.v[msgs.len - 1].content,
+                       "finish the task with a final response now") != NULL);
+    chat_msgs_free(&msgs);
+}
+
+static void test_powershell_persistent_pipe_guard(void) {
+    char detail[512] = {0};
+    tool_call unsafe = {
+        .name = "bash",
+        .arguments =
+            "{\"command\":\"Start-Process -FilePath 'node' "
+            "-ArgumentList 'index.js' -NoNewWindow\"}",
+    };
+    TEST_ASSERT(tool_call_has_persistent_pipe_risk(&unsafe,
+                                                    detail, sizeof(detail)));
+    TEST_ASSERT(strstr(detail, "inherits the agent tool pipes") != NULL);
+
+    tool_call detached_window = {
+        .name = "bash",
+        .arguments =
+            "{\"command\":\"Start-Process -FilePath 'node' "
+            "-ArgumentList 'index.js'\"}",
+    };
+    TEST_ASSERT(!tool_call_has_persistent_pipe_risk(&detached_window,
+                                                     detail, sizeof(detail)));
+
+    tool_call redirected = {
+        .name = "powershell",
+        .arguments =
+            "{\"command\":\"Start-Process node -NoNewWindow "
+            "-RedirectStandardInput in.txt -RedirectStandardOutput out.log "
+            "-RedirectStandardError err.log\"}",
+    };
+    TEST_ASSERT(!tool_call_has_persistent_pipe_risk(&redirected,
+                                                     detail, sizeof(detail)));
+
+    tool_call unrelated = {
+        .name = "read",
+        .arguments = "{\"filePath\":\"Start-Process -NoNewWindow\"}",
+    };
+    TEST_ASSERT(!tool_call_has_persistent_pipe_risk(&unrelated,
+                                                     detail, sizeof(detail)));
 }
 
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
@@ -15488,6 +15965,53 @@ static void test_dsml_decode_state_separates_structure_and_payload(void) {
     TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
 }
 
+static void test_dsml_long_payload_has_independent_budget(void) {
+    /* Regression for request 17: reasoning consumed part of the old fixed
+     * 768-token budget before DSML even started, truncating a valid edit/write
+     * payload.  Only tokens after the marker belong to this guard. */
+    TEST_ASSERT(dsml_tokens_since_start(768, 173) == 595);
+    TEST_ASSERT(dsml_tokens_since_start(173, 173) == 0);
+    TEST_ASSERT(dsml_tokens_since_start(100, -1) == 0);
+
+    buf generated = {0};
+    buf_puts(&generated,
+             "<think>prepare a large source edit</think>\n"
+             DS4_TOOL_CALLS_START "\n"
+             DS4_INVOKE_START " name=\"write\">\n"
+             DS4_PARAM_START " name=\"content\" string=\"true\">");
+    for (int i = 0; i < 24000; i++) buf_putc(&generated, (char)('a' + (i % 26)));
+    buf_puts(&generated,
+             DS4_PARAM_END "\n"
+             DS4_INVOKE_END "\n"
+             DS4_TOOL_CALLS_END);
+
+    /* Feed cumulative, irregularly fragmented input, as live token pieces do. */
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    const size_t strides[] = {1, 2, 7, 31, 127, 509};
+    size_t visible = 0;
+    size_t stride = 0;
+    while (visible < generated.len) {
+        visible += strides[stride++ % (sizeof(strides) / sizeof(strides[0]))];
+        if (visible > generated.len) visible = generated.len;
+        dsml_decode_tracker_update(&tracker, generated.ptr, visible);
+    }
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+
+    tool_calls calls = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex(generated.ptr, false,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && calls.v[0].arguments &&
+                strlen(calls.v[0].arguments) > 24000);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&generated);
+}
+
 static void test_tool_memory_max_ids_prunes_oldest(void) {
     const char *a_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
     const char *b_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
@@ -15994,6 +16518,14 @@ static void test_prefill_cancel_tracks_closed_stream_and_deadline(void) {
     p.stream_failed = false;
     p.deadline = now_sec() - 1.0;
     TEST_ASSERT(server_prefill_cancel_cb(&p));
+
+    p.deadline = now_sec() + 1.0;
+    p.t0 = now_sec();
+    p.last_t = p.t0;
+    double old_deadline = p.deadline;
+    server_progress_cb(&p, "prefill_chunk", 1, 2);
+    TEST_ASSERT(p.deadline > old_deadline);
+    TEST_ASSERT(!server_prefill_cancel_cb(&p));
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -16970,7 +17502,12 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
-    test_invalid_dsml_tool_error_suffix_includes_system_prompt();
+    test_no_tools_request_never_returns_dsml_calls();
+    test_invalid_dsml_tool_error_suffix_is_bounded();
+    test_protocol_lifecycle_stress();
+    test_identical_tool_loop_adds_guard();
+    test_alternating_tool_loop_adds_guard();
+    test_powershell_persistent_pipe_guard();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_forced_think_close_preserves_completed_tool_call();
@@ -16989,6 +17526,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
+    test_dsml_long_payload_has_independent_budget();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();

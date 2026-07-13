@@ -20,10 +20,13 @@ Environment=DS4_CUDA_NO_INDEXED_HEADS8=1
 # Persistent keyed CUDA Graph for the fixed-shape N>1 verifier.  The runtime
 # falls back to eager execution on capture/update failure.
 Environment=DS4_GRAPH_MTP_VERIFY=1
-# Hard upper bound for one single-flight request.  Increase only after
-# correlating long-context latency in the trace; prevents a wedged GPU/KV job
-# from occupying the only inference worker indefinitely.
+# Inactivity watchdog for one single-flight request.  The deadline is renewed
+# at every safe prefill frontier and decoded token, so a progressing long
+# context is never stopped merely because of total wall-clock duration.
 Environment=DS4_SERVER_JOB_TIMEOUT_SEC=3600
+# Buffer tool deltas until DSML is complete so malformed calls can be retried
+# without exposing irreversible partial JSON to OpenAI-compatible clients.
+Environment=DS4_SERVER_BUFFER_TOOL_STREAM=1
 
 MemoryHigh=118G
 TasksMax=80
