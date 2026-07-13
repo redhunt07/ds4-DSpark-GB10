@@ -718,14 +718,15 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 int assistant_token_id) {
     if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
 
-    /* Cold checkpoints maximize reuse across independent agent sessions.  The
-     * stable rendered chat prefix is everything before the user message that
-     * asks this specific task.  Some clients put stable user-role scaffolding
-     * first, so use the last user marker before the first assistant marker. */
+    /* Cold checkpoints maximize reuse across retries and superseded agent
+     * requests.  The stable rendered prefix is everything before the latest
+     * user message: clients commonly replace that final message while an older
+     * request is still prefilling.  Stopping at the first assistant marker
+     * reduced every multi-turn conversation to its initial system/user prefix
+     * and forced the complete history to be evaluated again. */
     int last_user = -1;
     for (int i = 0; i < prompt->len; i++) {
         const int token = prompt->v[i];
-        if (token == assistant_token_id) break;
         if (token == user_token_id) last_user = i;
     }
     return last_user >= kc->opt.min_tokens ? last_user : -1;

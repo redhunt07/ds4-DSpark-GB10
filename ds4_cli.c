@@ -899,6 +899,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
  * just-generated token (the LK target p[pos]). Renormalize exp(logprob) over the
  * top-N so it sums to 1. Layout mirrors .mhcd: u32 'MPDT' u32 pos u32 n,
  * i32 idx[n], f32 val[n]. */
+#ifndef DS4_NO_GPU
 static void mtp_write_pdist(FILE *pf, uint32_t pos, const ds4_token_score *s, int n) {
     if (!pf || n <= 0) return;
     double z = 0.0;
@@ -1049,6 +1050,7 @@ static int run_mtp_harvest(ds4_engine *engine, const cli_config *cfg) {
                 total_pos / gen_sec * 3600.0 / 1000.0);
     return 0;
 }
+#endif
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
@@ -1900,7 +1902,12 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.mtp_harvest_corpus) {
+#ifdef DS4_NO_GPU
+        fprintf(stderr, "ds4: --mtp-harvest requires a GPU build\n");
+        rc = 1;
+#else
         rc = run_mtp_harvest(engine, &cfg);
+#endif
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

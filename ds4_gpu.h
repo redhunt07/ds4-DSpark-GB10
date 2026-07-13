@@ -59,6 +59,7 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_graph_capture_begin(void);
 int ds4_gpu_graph_capture_replay(void);
 int ds4_gpu_graph_capture_update_launch(void);
+int ds4_gpu_graph_capture_update_launch_key(uint32_t key);
 #endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -1133,6 +1134,11 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Development regression for the SM121 IQ2_XXS x Q8_K MoE path.  Compares
+ * the scalar dp4a reference with the shared-LUT eight-row tile used as the
+ * correctness baseline for the Blackwell INT8-MMA implementation. */
+int ds4_gpu_iq2_q8_tile_selftest(void);
 
 #ifdef __cplusplus
 }

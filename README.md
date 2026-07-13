@@ -28,12 +28,12 @@ NVIDIA DGX Spark / GB10 (`sm_121`) e per il modello
 
 | Area | Implementazione |
 |---|---|
-| Backend | CUDA GB10 con PTX JIT; il percorso validato evita `CUDA_ARCH=sm_121` esplicito |
+| Backend | CUDA 13 GB10 con target family-specific `sm_121f`, validato su DGX Spark |
 | DSpark | Worker e tensori DSpark embedded nel modello base; non richiede un secondo modello piccolo |
 | Speculative decode | Pipeline ufficiale `main_hidden → main_proj → stages → Markov → confidence`, con verifica target combinata N=2/N=3 |
 | Target forward | Attention non-causale DSpark, output-head microbatch, cache HC e hot target cache |
 | CUDA | Q8 share-warp, graph decode, prewarm Q8→F16, cache HBM dei pesi caldi |
-| KV | KV cache F16 per contesti grandi, checkpoint persistenti e riuso dei prefissi |
+| KV | KV cache F16 da 32k token in su, checkpoint persistenti e riuso dei prefissi |
 | Server | API OpenAI/Responses/Anthropic, tool call DSML, replay esatto dei tool e continuazioni KV |
 | Agent | `ds4-agent` con percorso speculative decode integrato |
 | Tooling | Benchmark, profiler, diagnostica acceptance e test di identità token |
@@ -63,8 +63,9 @@ make test                       # test completi
 ./ds4-server --help
 ```
 
-Il target GB10 usa PTX JIT. Evitare di forzare `CUDA_ARCH=sm_121` se si vuole
-replicare il benchmark validato.
+Il target GB10 usa `sm_121f`: il suffisso family-specific abilita il set completo
+di feature SM121 esposto da CUDA 13. Il target generico `sm_121` resta supportato,
+ma nei test A/B è risultato più lento.
 
 ## Modello DSpark
 
@@ -108,7 +109,7 @@ Nei log devono comparire `algorithm=dspark`, `carrier=official-dspark` e
 ./ds4 --cuda \
   --model gguf/DeepSeek-V4-Flash-DSpark-Abliterated-COMBINED-Q2.correct.gguf \
   --dspark --ctx 131072 --tokens 32768 -t 10 \
-  --prefill-chunk 2048 --temp 0 --nothink
+  --prefill-chunk 1024 --temp 0 --nothink
 ```
 
 ### Profilo GB10 da 17–18 tok/s
@@ -118,8 +119,9 @@ tools/perf/dspark/run-17tps.sh \
   tests/test-vectors/prompts/long_code_audit.txt
 ```
 
-Il launcher imposta il GGUF corretto, `DS4_CUDA_FAST_VERIFY=1`, il percorso
-MoE deterministico e tutti i parametri del benchmark.
+Il launcher storico imposta il GGUF corretto e il verifier veloce globale. Per
+produzione è preferibile `DS4_CUDA_FAST_VERIFY_F16=1`, che accelera soltanto i
+GEMM F16 N>1 del verifier e conserva il percorso canonico N=1.
 
 ## Configurazioni consigliate
 
@@ -130,7 +132,7 @@ Usare il verifier deterministico, senza fast mode:
 ```sh
 env DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 \
   ./ds4 --cuda --model "$MODEL" --dspark \
-  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 2048 \
+  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 1024 \
   --temp 0 --nothink
 ```
 
@@ -144,7 +146,7 @@ env DS4_CUDA_FAST_VERIFY=1 \
     DS4_CUDA_NO_INDEXED_HEADS8=1 \
     DS4_GRAPH_DECODE=1 \
   ./ds4 --cuda --model "$MODEL" --dspark \
-  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 2048 \
+  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 1024 \
   --temp 0 --nothink
 ```
 
@@ -162,6 +164,7 @@ logit; restano attive le ottimizzazioni GEMM del fast verify.
 - `--mtp`: non serve con il GGUF DSpark embedded e cambia percorso.
 - `--ssd-streaming`: modalità di capacità, non di prestazioni quando il modello entra nella memoria unificata.
 - `--quality`: utile solo per debug numerico; riduce sensibilmente il throughput.
+- `--adaptive-thinking`: per richieste senza `thinking`/`reasoning_effort`, usa thinking normale per tool, diagnosi, codice e task multi-step; gli override API e gli alias `deepseek-chat`/`deepseek-reasoner` restano prioritari.
 - `--think-max`: aumenta i token di ragionamento, quindi il tempo alla risposta finale.
 
 ## Opzioni CLI
@@ -174,7 +177,7 @@ logit; restano attive le ottimizzazioni GEMM del fast verify.
 | `--ctx N`, `-c N` | Capacità del contesto/KV |
 | `--tokens N`, `-n N` | Massimo token generati |
 | `-t N` | Thread CPU helper |
-| `--prefill-chunk N` | Dimensione chunk prefill; `2048` è il valore GB10 consigliato |
+| `--prefill-chunk N` | Dimensione chunk prefill; `1024` è il valore GB10 consigliato |
 | `--temp F` | Temperatura; `0` = greedy |
 | `--nothink` | Disabilita il ragionamento esteso |
 | `--think`, `--think-max` | Abilita ragionamento normale/massimo |
@@ -251,7 +254,7 @@ Avvio manuale:
 ```sh
 ./ds4-server --cuda --dspark \
   --model gguf/DeepSeek-V4-Flash-DSpark-Abliterated-COMBINED-Q2.correct.gguf \
-  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 2048 \
+  --ctx 131072 --tokens 32768 -t 10 --prefill-chunk 1024 \
   --host 0.0.0.0 --port 8000 --cors --warm-weights
 ```
 
@@ -320,7 +323,7 @@ La KV cache persistente accelera prefissi ripetuti e continuazioni agent:
 --kv-disk-dir /path/kv-cache
 --kv-disk-space-mb 98304
 --kv-cache-min-tokens 512
---kv-cache-cold-max-tokens 60000
+--kv-cache-cold-max-tokens 120000
 --kv-cache-continued-interval-tokens 8192
 --kv-cache-boundary-trim-tokens 32
 --kv-cache-boundary-align-tokens 2048
@@ -348,8 +351,12 @@ Variabili utili:
 | Variabile | Uso |
 |---|---|
 | `DS4_CUDA_FAST_VERIFY=1` | Verifier CUDA veloce sperimentale; possibile differenza greedy anche su logit vicini |
+| `DS4_CUDA_FAST_VERIFY_F16=1` | Solo GEMM F16 N>1 del verifier; N=1 canonico invariato (profilo GB10 validato) |
+| `DS4_CUDA_FAST_VERIFY_MOE=1` | Solo MoE batched del verifier; sperimentale |
+| `DS4_CUDA_FAST_VERIFY_ATTN=1` | Solo attenzione batched N>1 del verifier; sperimentale |
 | `DS4_CUDA_NO_INDEXED_HEADS8=1` | Disabilita il ramo attention heads8 non canonico; consigliato a contesto lungo |
 | `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1` | Riduzione MoE deterministica |
+| `DS4_COMP_KV_F16=1` | Forza F16 comp-KV; il servizio lo seleziona automaticamente per contesti >=32k |
 | `DS4_GRAPH_DECODE=1` | CUDA graph decode |
 | `DS4_DSPARK_TIMING=1` | Tempi per iterazione DSpark |
 | `DS4_DSPARK_SPEC_LOG=1` | Draft, commit e fallback |

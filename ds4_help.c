@@ -159,6 +159,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+        opt(fp, c, "--adaptive-thinking", "Choose thinking for complex unconfigured requests; explicit API controls win.");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
@@ -321,7 +322,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to direct answers unless thinking is explicitly enabled.");
+    para(fp, c, "DeepSeek-compatible chat requests default to direct answers unless thinking is explicitly enabled. With --adaptive-thinking, tool use, multi-turn work, code, and diagnostic tasks automatically use normal thinking when no client control or model alias is supplied.");
     para(fp, c, "reasoning_effort=high, reasoning_effort=xhigh, or output_config.effort=max requests thinking.");
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, reasoning_effort=low, or model=deepseek-chat selects non-thinking mode.");

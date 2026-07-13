@@ -89,6 +89,7 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     return false;
 }
 
+#ifndef DS4_NO_GPU
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
 #ifdef DS4_ROCM_BUILD
@@ -98,6 +99,7 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
 #endif
     return false;
 }
+#endif
 
 /* =========================================================================
  * DeepSeek V4 Shape Profiles.
@@ -888,6 +890,7 @@ static void ds4_expert_profile_init(const char *path, const char *hotlist_path) 
             g_expert_profile.hotlist_path ? g_expert_profile.hotlist_path : "disabled");
 }
 
+#ifndef DS4_NO_GPU
 static void ds4_expert_profile_cache_use(
         uint32_t ci,
         uint32_t il,
@@ -923,7 +926,9 @@ static void ds4_expert_profile_cache_use(
     for (uint32_t i = n; i > 0; i--) entries[i] = entries[i - 1];
     entries[0] = expert;
 }
+#endif
 
+#ifndef DS4_NO_GPU
 static void ds4_expert_profile_record(
         uint32_t      il,
         uint32_t      pos,
@@ -974,6 +979,7 @@ static void ds4_expert_profile_record(
         }
     }
 }
+#endif
 
 static void ds4_expert_profile_write_cache_summary(FILE *fp) {
     ds4_expert_profile *p = &g_expert_profile;
@@ -1207,6 +1213,7 @@ static void ds4_expert_profile_close(void) {
     memset(p, 0, sizeof(*p));
 }
 
+#ifndef DS4_NO_GPU
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -1220,6 +1227,7 @@ static void sleep_sec(double sec) {
     /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
     (void)nanosleep(&req, &req);
 }
+#endif
 
 static const char *ds4_log_color_code(ds4_log_type type) {
     switch (type) {
@@ -3661,6 +3669,7 @@ static bool weights_layers_bound(const ds4_weights *w, uint32_t layer_start, uin
     return true;
 }
 
+#ifndef DS4_NO_GPU
 static const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) {
     if (!w) return NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -3668,6 +3677,7 @@ static const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) 
     }
     return NULL;
 }
+#endif
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * For distributed sliced GGUFs, only the advertised local layer range is
@@ -10562,12 +10572,13 @@ static inline int ds4_comp_kv_f16_for_ctx(uint32_t ctx) { (void)ctx; return 1; }
 
 #if !defined(__APPLE__)
 /* Context-length gate for the CUDA comp-KV in-memory dtype.  F16 halves the
- * comp-KV read (a long-context win) but costs ~1.7% decode at short/mid ctx
- * where the comp cache is tiny.  Decide F16 vs F32 per-session by the context
- * allocation size.  Safe because the on-disk KV format is ALWAYS F32 (save:
+ * comp-KV read and is required for reliable long-context decode: the legacy
+ * F32 path degenerates to repeated BOS after a 30k-token chunked prefill.
+ * Keep F32 only for allocations too short to reach that failure regime, where
+ * it remains ~1.7% faster.  Safe because the on-disk KV format is ALWAYS F32 (save:
  * payload_write_tensor_span_f16_as_f32, restore: payload_read_tensor_span_f32_as_f16),
  * so the in-memory dtype is free to vary per session without breaking KV files. */
-#define DS4_COMP_KV_F16_MIN_CTX 131072u
+#define DS4_COMP_KV_F16_MIN_CTX 32768u
 
 static int ds4_comp_kv_f16_for_ctx(uint32_t ctx) {
     const char *ov = getenv("DS4_COMP_KV_F16");
@@ -17550,10 +17561,10 @@ static bool metal_graph_dspark_encode_forward_embed(
     for (uint32_t i = 1; i < active_tokens; i++) {
         tokens[i] = (int32_t)mtp->dspark.noise_token_id;
     }
-    bool ok = ds4_gpu_tensor_write(g->prefill_tokens,
-                                   0,
-                                   tokens,
-                                   (uint64_t)active_tokens * sizeof(tokens[0])) != 0;
+    bool ok = getenv("DS4_GRAPH_DSPARK_TOKENS_STAGED") != NULL
+        ? true
+        : ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens,
+                               (uint64_t)active_tokens * sizeof(tokens[0])) != 0;
     if (ok) {
         ok = ds4_gpu_embed_tokens_hc_tensor(g->dspark_block_hc,
                                             g->prefill_tokens,
@@ -17977,7 +17988,34 @@ static int metal_graph_eval_dspark_draft_block(
     const uint32_t active_tokens = block_size;
     const bool profile = getenv("DS4_DSPARK_DRAFT_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
-    bool ok = ds4_gpu_begin_commands() != 0;
+    /* The DSpark block has fixed geometry (block_size/rank) and is a safe
+     * candidate for a persistent CUDA graph.  Keep it opt-in until measured;
+     * the surrounding verify path remains eager for correctness. */
+#ifdef DS4_GRAPH_DECODE_BUILD
+    const bool dgraph = getenv("DS4_GRAPH_DSPARK_DRAFT") != NULL;
+#else
+    const bool dgraph = false;
+#endif
+    (void)dgraph;
+    bool ok;
+    ok = ds4_gpu_begin_commands() != 0;
+    /* Pageable host copies cannot be recorded by CUDA Graph.  Stage the
+     * fixed-shape token vector before beginning capture; the graph then sees
+     * only device-side work. */
+#ifdef DS4_GRAPH_DECODE_BUILD
+    if (ok && dgraph) {
+        int32_t staged[5];
+        staged[0] = anchor_token;
+        for (uint32_t i = 1; i < active_tokens; ++i)
+            staged[i] = (int32_t)mtp->dspark.noise_token_id;
+        ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, staged,
+                                  (uint64_t)active_tokens * sizeof(staged[0])) != 0;
+        if (ok) {
+            (void)setenv("DS4_GRAPH_DSPARK_TOKENS_STAGED", "1", 1);
+            ok = ds4_gpu_graph_capture_begin() != 0;
+        }
+    }
+#endif
     if (ok) ok = metal_graph_dspark_encode_forward_embed(g, base_model, base_weights, mtp, anchor_token, active_tokens);
     const double t_embed = profile ? now_sec() : 0.0;
     if (ok) ok = metal_graph_dspark_seed_all_stage_main_kv(g, mtp_model, mtp, pos);
@@ -18013,7 +18051,15 @@ static int metal_graph_eval_dspark_draft_block(
                 rank,
                 DS4_N_EMBD) != 0;
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) {
+#ifdef DS4_GRAPH_DECODE_BUILD
+        ok = dgraph ? (ds4_gpu_graph_capture_update_launch_key(n_steps) != 0)
+                    : (ds4_gpu_end_commands() != 0);
+#else
+        ok = ds4_gpu_end_commands() != 0;
+#endif
+    }
+    if (dgraph) (void)unsetenv("DS4_GRAPH_DSPARK_TOKENS_STAGED");
     int produced = 0;
     if (ok) {
         ok = ds4_gpu_tensor_read(g->comp_selected,
@@ -18471,7 +18517,10 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     const char *fast_verify_env = getenv("DS4_CUDA_FAST_VERIFY");
-    const bool fast_verify = fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0;
+    const char *fast_attn_env = getenv("DS4_CUDA_FAST_VERIFY_ATTN");
+    const bool fast_verify =
+        (fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0) ||
+        (fast_attn_env && fast_attn_env[0] && strcmp(fast_attn_env, "0") != 0);
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -20147,7 +20196,10 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     const char *fast_verify_env = getenv("DS4_CUDA_FAST_VERIFY");
-    const bool fast_verify = fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0;
+    const char *fast_moe_env = getenv("DS4_CUDA_FAST_VERIFY_MOE");
+    const bool fast_verify =
+        (fast_verify_env && fast_verify_env[0] && strcmp(fast_verify_env, "0") != 0) ||
+        (fast_moe_env && fast_moe_env[0] && strcmp(fast_moe_env, "0") != 0);
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -22753,9 +22805,17 @@ static bool metal_graph_verify_suffix_tops(
             ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
         }
         /* Always end the capture (clean the stream) + launch the cached exec. */
-        int launch_ok = ds4_gpu_graph_capture_update_launch();
+        int launch_ok = ds4_gpu_graph_capture_update_launch_key(n_tokens);
         ok = ok && (launch_ok != 0);
-        if (!ok) (void)ds4_gpu_synchronize();
+        if (!ok) {
+            /* A graph is an optimization, never a correctness dependency:
+             * replay the same layer batch eagerly after capture/update failure. */
+            (void)ds4_gpu_synchronize();
+            ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++)
+                ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+        }
 #endif
     } else {
         ok = ds4_gpu_begin_commands() != 0;
@@ -24438,6 +24498,7 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
     if (logit1) *logit1 = v1;
 }
 
+#ifndef DS4_NO_GPU
 static float tensor_value_to_f32(const ds4_tensor *t, const void *data, uint64_t idx) {
     if (!t || !data) return 0.0f;
     switch (t->type) {
@@ -24550,6 +24611,7 @@ static void mtp_alpha_probe(const float *p, const float *q, uint32_t n_vocab) {
         fputc('\n', stderr);
     }
 }
+#endif
 
 static uint64_t sample_rng_next(uint64_t *state) {
     uint64_t x = *state;
@@ -26460,6 +26522,7 @@ static bool ds4_official_dspark_spec_opt_in(void) {
            strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0;
 }
 
+#ifndef DS4_NO_GPU
 static const char *spec_env_name(const ds4_engine *e, const char *mtp_name, const char *dspark_name) {
     return e && e->dspark_ready ? dspark_name : mtp_name;
 }
@@ -26467,6 +26530,7 @@ static const char *spec_env_name(const ds4_engine *e, const char *mtp_name, cons
 static bool spec_env_is_set(const ds4_engine *e, const char *mtp_name, const char *dspark_name) {
     return getenv(spec_env_name(e, mtp_name, dspark_name)) != NULL;
 }
+#endif
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
@@ -28296,6 +28360,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#ifndef DS4_NO_GPU
 static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
 #ifdef DS4_NO_GPU
     (void)e;
@@ -28461,6 +28526,7 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
     return true;
 #endif
 }
+#endif
 
 #ifndef DS4_NO_GPU
 static bool accelerator_cache_hc_decode_weights(const ds4_model *model,
@@ -29593,9 +29659,11 @@ static bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
+#ifndef DS4_NO_GPU
 static bool ds4_session_cancelled_cb(void *ud) {
     return ds4_session_cancelled(ud);
 }
+#endif
 
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
@@ -29731,6 +29799,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)output_hc;
+#endif
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -30198,7 +30269,9 @@ static void ds4_session_note_dspark_commit(ds4_session *s, int draft_n, int comm
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+#ifndef DS4_NO_GPU
 static bool ds4_session_eval_token_graph(ds4_session *s, int token, uint32_t pos, float *logits);
+#endif
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
@@ -30700,6 +30773,7 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 
 /* Cached gate for the plain-decode batch-forward reroute (see the call site
  * in ds4_session_eval_internal).  Latched on first use, like fast_verify. */
+#ifndef DS4_NO_GPU
 static bool ds4_batch_decode_enabled(void) {
     static int cached = -1;
     if (cached < 0) cached = getenv("DS4_BATCH_DECODE") != NULL ? 1 : 0;
@@ -30710,6 +30784,7 @@ static bool ds4_env_flag_on(const char *name) {
     const char *value = getenv(name);
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
+#endif
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
@@ -32167,6 +32242,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #endif
 }
 
+#ifndef DS4_NO_GPU
 static int ds4_session_eval_speculative_sample_seq(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         float temperature, int top_k, float top_p, float min_p,
@@ -32663,6 +32739,7 @@ static int ds4_session_eval_speculative_argmax_seq(
     s->mtp_draft_valid = false;
     return n_accept;
 }
+#endif
 
 /* Distribution-preserving speculative SAMPLING decode (DSpark at temperature > 0).
  * Counterpart to ds4_session_eval_speculative_argmax: drafts come from the official

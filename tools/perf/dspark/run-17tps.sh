@@ -13,5 +13,5 @@ exec env \
   "$repo_dir/ds4" --cuda \
   --model "$model" --dspark \
   --ctx 131072 --tokens 32768 -t 10 \
-  --prefill-chunk 2048 --temp 0 --nothink \
+  --prefill-chunk 1024 --temp 0 --nothink \
   --prompt-file "$prompt" "$@"

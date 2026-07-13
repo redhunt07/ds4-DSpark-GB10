@@ -29,9 +29,14 @@ static inline float f16_to_f32(uint16_t h) {
     uint32_t sign = (h & 0x8000) << 16;
     int32_t exp = (h >> 10) & 0x1F;
     uint32_t frac = h & 0x3FF;
-    if (exp == 0) return *(float *)&sign;
-    if (exp == 31) return *(float *)(uint32_t[]){ sign | 0x7F800000 | (frac << 13) };
-    uint32_t f = sign | ((exp + 127 - 15) << 23) | (frac << 13);
+    uint32_t f;
+    if (exp == 0) {
+        f = sign;
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (frac << 13);
+    } else {
+        f = sign | ((uint32_t)(exp + 127 - 15) << 23) | (frac << 13);
+    }
     float out;
     memcpy(&out, &f, sizeof(out));
     return out;

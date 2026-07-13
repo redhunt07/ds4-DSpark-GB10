@@ -677,6 +677,9 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    /* Why the server selected think_mode.  Kept metadata-only so traces can
+     * explain an automatic decision without retaining prompt contents. */
+    char think_policy[96];
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -888,20 +891,29 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     return false;
 }
 
-static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
+static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out,
+                                         bool *specified) {
     json_ws(p);
+    if (specified) *specified = false;
     if (json_lit(p, "null")) return true;
     char *effort = NULL;
     if (!json_string(p, &effort)) return false;
     bool ok = parse_reasoning_effort_name(effort, out);
     free(effort);
+    if (ok && specified) *specified = true;
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
+                                         bool *specified) {
     json_ws(p);
+    if (specified) *specified = false;
     if (json_lit(p, "null")) return true;
-    if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
+    if (**p == 't' || **p == 'f') {
+        bool ok = json_bool(p, thinking_enabled);
+        if (ok && specified) *specified = true;
+        return ok;
+    }
     if (**p != '{') return json_skip_value(p);
     (*p)++;
     json_ws(p);
@@ -920,8 +932,13 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
                 free(key);
                 return false;
             }
-            if (!strcmp(type, "enabled")) *thinking_enabled = true;
-            else if (!strcmp(type, "disabled")) *thinking_enabled = false;
+            if (!strcmp(type, "enabled")) {
+                *thinking_enabled = true;
+                if (specified) *specified = true;
+            } else if (!strcmp(type, "disabled")) {
+                *thinking_enabled = false;
+                if (specified) *specified = true;
+            }
             free(type);
         } else if (!json_skip_value(p)) {
             free(key);
@@ -937,7 +954,9 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
-static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
+static bool parse_output_config_effort(const char **p, ds4_think_mode *effort,
+                                       bool *specified) {
+    if (specified) *specified = false;
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -953,10 +972,12 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
         }
         (*p)++;
         if (!strcmp(key, "effort")) {
-            if (!parse_reasoning_effort_value(p, effort)) {
+            bool value_specified = false;
+            if (!parse_reasoning_effort_value(p, effort, &value_specified)) {
                 free(key);
                 return false;
             }
+            if (value_specified && specified) *specified = true;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -977,6 +998,82 @@ static bool model_alias_disables_thinking(const char *model) {
 
 static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static bool adaptive_thinking_enabled(void) {
+    const char *value = getenv("DS4_ADAPTIVE_THINKING");
+    return value && value[0] && strcmp(value, "0");
+}
+
+static bool text_has_ascii_ci(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return false;
+    size_t n = strlen(needle);
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        size_t i = 0;
+        while (i < n && p[i] && tolower(p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static ds4_think_mode select_think_mode(bool got_control, bool thinking_enabled,
+                                        ds4_think_mode effort, const char *model,
+                                        const chat_msgs *msgs, const char *prompt,
+                                        bool has_tools, int ctx_size,
+                                        char *policy, size_t policy_len) {
+    ds4_think_mode mode = DS4_THINK_NONE;
+    const char *reason = "default-direct";
+    if (got_control) {
+        mode = think_mode_from_enabled(thinking_enabled, effort);
+        reason = "explicit-request";
+    } else if (model_alias_disables_thinking(model)) {
+        reason = "model-alias-chat";
+    } else if (model_alias_enables_thinking(model)) {
+        mode = DS4_THINK_HIGH;
+        reason = "model-alias-reasoner";
+    } else if (adaptive_thinking_enabled()) {
+        int score = has_tools ? 4 : 0;
+        size_t bytes = 0;
+        int user_turns = 0;
+        static const char *const complex_terms[] = {
+            "debug", "diagnos", "fix", "patch", "error", "exception",
+            "stack trace", "traceback", "regression", "test", "implement",
+            "refactor", "compile", "build", "analysis", "analizza",
+            "correggi", "errore", "confronta", "compare", "prove"
+        };
+        if (msgs) {
+            for (int i = 0; i < msgs->len; i++) {
+                const chat_msg *m = &msgs->v[i];
+                const char *content = m->content ? m->content : "";
+                bytes += strlen(content);
+                if (m->role && !strcmp(m->role, "user")) user_turns++;
+                for (size_t k = 0; k < sizeof(complex_terms) / sizeof(complex_terms[0]); k++) {
+                    if (text_has_ascii_ci(content, complex_terms[k])) { score += 2; break; }
+                }
+                if (strstr(content, "```") || strstr(content, "<｜") ||
+                    text_has_ascii_ci(content, ".c") || text_has_ascii_ci(content, ".py")) score += 2;
+            }
+        } else if (prompt) {
+            bytes = strlen(prompt);
+            for (size_t k = 0; k < sizeof(complex_terms) / sizeof(complex_terms[0]); k++) {
+                if (text_has_ascii_ci(prompt, complex_terms[k])) { score += 2; break; }
+            }
+            if (strstr(prompt, "```") || text_has_ascii_ci(prompt, ".c") ||
+                text_has_ascii_ci(prompt, ".py")) score += 2;
+        }
+        if (user_turns > 1) score += 2;
+        if (bytes >= 1200) score += 2;
+        if (bytes >= 8000) score += 2;
+        if (score >= 4) {
+            mode = DS4_THINK_HIGH;
+            reason = has_tools ? "adaptive-tools-or-complex" : "adaptive-complex";
+        } else {
+            reason = "adaptive-direct";
+        }
+    }
+    mode = ds4_think_mode_for_context(mode, ctx_size);
+    if (policy && policy_len) snprintf(policy, policy_len, "%s", reason);
+    return mode;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
@@ -2857,15 +2954,21 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            bool thinking_specified = false;
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &thinking_specified)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
+            if (thinking_specified) got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+            bool effort_specified = false;
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort, &effort_specified)) {
                 free(key);
                 goto bad;
+            }
+            if (effort_specified) {
+                got_thinking = true;
+                thinking_enabled = reasoning_effort != DS4_THINK_NONE;
             }
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
@@ -2896,10 +2999,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = select_think_mode(got_thinking, thinking_enabled,
+                                      reasoning_effort, r->model, &msgs, NULL,
+                                      r->has_tools, ctx_size,
+                                      r->think_policy, sizeof(r->think_policy));
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -3061,20 +3164,31 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            bool thinking_specified = false;
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &thinking_specified)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
+            if (thinking_specified) got_thinking = true;
         } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+            bool effort_specified = false;
+            if (!parse_output_config_effort(&p, &reasoning_effort, &effort_specified)) {
                 free(key);
                 goto bad;
+            }
+            if (effort_specified) {
+                got_thinking = true;
+                thinking_enabled = reasoning_effort != DS4_THINK_NONE;
             }
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+            bool effort_specified = false;
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort, &effort_specified)) {
                 free(key);
                 goto bad;
+            }
+            if (effort_specified) {
+                got_thinking = true;
+                thinking_enabled = reasoning_effort != DS4_THINK_NONE;
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -3102,10 +3216,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_msgs_push(&msgs, msg);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = select_think_mode(got_thinking, thinking_enabled,
+                                      reasoning_effort, r->model, &msgs, NULL,
+                                      r->has_tools, ctx_size,
+                                      r->think_policy, sizeof(r->think_policy));
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -3790,11 +3904,12 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
             if (json_lit(p, "null")) {
                 /* nothing */
             } else {
-                if (!parse_reasoning_effort_value(p, effort)) {
+                bool value_specified = false;
+                if (!parse_reasoning_effort_value(p, effort, &value_specified)) {
                     free(key);
                     return false;
                 }
-                if (effort_seen) *effort_seen = true;
+                if (value_specified && effort_seen) *effort_seen = true;
             }
         } else if (!strcmp(key, "summary")) {
             json_ws(p);
@@ -4064,10 +4179,10 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = select_think_mode(got_thinking, thinking_enabled,
+                                      reasoning_effort, r->model, &msgs, NULL,
+                                      r->has_tools, ctx_size,
+                                      r->think_policy, sizeof(r->think_policy));
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -4225,15 +4340,21 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            bool thinking_specified = false;
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &thinking_specified)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
+            if (thinking_specified) got_thinking = true;
         } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
+            bool effort_specified = false;
+            if (!parse_reasoning_effort_value(&p, &reasoning_effort, &effort_specified)) {
                 free(key);
                 goto bad;
+            }
+            if (effort_specified) {
+                got_thinking = true;
+                thinking_enabled = reasoning_effort != DS4_THINK_NONE;
             }
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
@@ -4261,10 +4382,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = select_think_mode(got_thinking, thinking_enabled,
+                                      reasoning_effort, r->model, NULL, prompt,
+                                      false, ctx_size,
+                                      r->think_policy, sizeof(r->think_policy));
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
     if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
@@ -9429,12 +9550,13 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nthink_policy: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             ds4_think_mode_name(j->req.think_mode),
+            j->req.think_policy[0] ? j->req.think_policy : "unspecified",
             j->req.prompt.len,
             effective_prompt_tokens,
             cached,
@@ -9591,6 +9713,13 @@ typedef struct {
     double last_keepalive;
     double deadline;
 } server_prefill_progress;
+
+static bool server_prefill_cancel_cb(void *ud) {
+    const server_prefill_progress *p = ud;
+    if (!p) return false;
+    return g_stop_requested || p->stream_failed ||
+           (p->deadline > 0.0 && now_sec() >= p->deadline);
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -9750,6 +9879,65 @@ static int chat_think_tool_recovery(server *s,
     *scan_from = text->len;
     ds4_tokens_free(&toks);
     return 1;
+}
+
+/* An EOS while still inside <think> must not be exposed as a successful empty
+ * answer.  Close the server-owned reasoning surface once and let the model
+ * sample its visible answer/tool action from that valid frontier. */
+static int chat_force_close_thinking(server *s, buf *text,
+                                     thinking_state *thinking,
+                                     int *completion, int max_tokens,
+                                     char *err, size_t errlen) {
+    static const char inject[] = "</think>\n\n";
+    if (!thinking || !thinking->inside) return 0;
+    ds4_tokens toks = {0};
+    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
+    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    if (toks.len <= 0 || toks.len >= room || *completion + toks.len >= max_tokens) {
+        ds4_tokens_free(&toks);
+        return 0;
+    }
+    for (int i = 0; i < toks.len; i++) {
+        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+            ds4_tokens_free(&toks);
+            return -1;
+        }
+        (*completion)++;
+    }
+    buf_append(text, inject, sizeof(inject) - 1);
+    thinking_state_feed(thinking, inject, sizeof(inject) - 1);
+    ds4_tokens_free(&toks);
+    return 1;
+}
+
+/* The recovery above feeds </think> after a DSML opening because changing the
+ * already-evaluated token prefix is impossible.  Usually the model restarts a
+ * fresh tool block after that close.  It can instead finish the already-open
+ * block, leaving the server-injected close in the middle of valid DSML:
+ *
+ *   <think> ... <tool_calls> ... </think> ... </tool_calls>
+ *
+ * That is not executable as-is (correctly: the opening was in reasoning), but
+ * it is unambiguously a server-recovered action.  For response parsing only,
+ * move our own injected close immediately before that opening.  No model text
+ * is changed, and the caller still validates the complete DSML before exposing
+ * a tool call. */
+static char *normalize_forced_think_tool_close(const char *text,
+                                               size_t tool_start,
+                                               size_t injected_close) {
+    static const char injected[] = "</think>\n\n";
+    const size_t injected_len = sizeof(injected) - 1;
+    if (!text || tool_start > injected_close ||
+        strncmp(text + injected_close, injected, injected_len) != 0)
+    {
+        return NULL;
+    }
+    buf out = {0};
+    buf_append(&out, text, tool_start);
+    buf_append(&out, injected, injected_len);
+    buf_append(&out, text + tool_start, injected_close - tool_start);
+    buf_puts(&out, text + injected_close + injected_len);
+    return buf_take(&out);
 }
 
 static char *rendered_chat_system_region(const char *prompt_text) {
@@ -10496,6 +10684,10 @@ static void generate_job(server *s, job *j) {
         .deadline = job_deadline,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
+    /* A superseded streaming request must not monopolize the single inference
+     * worker until a long prefill completes.  The backend checks this callback
+     * only at frontiers where its live checkpoint remains valid. */
+    ds4_session_set_cancel(s->session, server_prefill_cancel_cb, &progress);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
@@ -10575,17 +10767,27 @@ static void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        int prefix_sync_rc = ds4_session_sync(s->session, &prefix, err, sizeof(err));
+        if (prefix_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
+            ds4_session_set_cancel(s->session, NULL, NULL);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            if (prefix_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+                kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
-            trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            if (prefix_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: %s ctx=%s prefill cancelled at safe KV frontier",
+                           j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+                trace_event(s, trace_id, "prefill cancelled at safe KV frontier");
+            } else {
+                trace_event(s, trace_id, "prefill failed: %s", err);
+                send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            }
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10599,16 +10801,26 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    int prompt_sync_rc = ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err));
+    ds4_session_set_cancel(s->session, NULL, NULL);
+    if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        if (prompt_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
-        trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        if (prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s prefill cancelled at safe KV frontier",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            trace_event(s, trace_id, "prefill cancelled at safe KV frontier");
+        } else {
+            trace_event(s, trace_id, "prefill failed: %s", err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        }
         return;
     }
     if (now_sec() >= job_deadline) {
@@ -10632,6 +10844,23 @@ static void generate_job(server *s, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
+    /* Persist the exact, fully-synchronized request frontier before generation.
+     * Agent tool loops often append only assistant/tool messages, so their
+     * latest user marker remains near the beginning of the conversation.  A
+     * user-anchor-only cache then falls back to that tiny prefix every turn.
+     * Unlike an intermediate prefill snapshot, this frontier has complete raw
+     * and compressed KV/compressor state and is safe to restore. */
+    if (s->kv.enabled &&
+        prompt_tokens >= s->kv.opt.min_tokens &&
+        (s->kv.opt.cold_max_tokens == 0 ||
+         prompt_tokens <= s->kv.opt.cold_max_tokens) &&
+        prompt_tokens > cached)
+    {
+        if (kv_cache_store_live_prefix(s, prompt_for_sync,
+                                       prompt_tokens, "prompt")) {
+            kv_cache_note_store(&s->kv, prompt_tokens);
+        }
+    }
     kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -10763,8 +10992,23 @@ decode_again:
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
+    size_t forced_think_tool_start = SIZE_MAX;
+    size_t forced_think_close_at = SIZE_MAX;
+    bool eos_think_recovery_attempted = false;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    /* Never let a malformed DSML envelope monopolize a session until the
+     * global watchdog.  A valid tool call normally closes within a few
+     * hundred tokens; this guard is configurable for unusually large JSON
+     * arguments and turns the failure into a clean client-visible error. */
+    int dsml_unterminated_limit = 4096;
+    const char *dsml_limit_env = getenv("DS4_SERVER_DSML_UNTERMINATED_MAX_TOKENS");
+    if (dsml_limit_env && dsml_limit_env[0]) {
+        char *limit_end = NULL;
+        long limit_value = strtol(dsml_limit_env, &limit_end, 10);
+        if (limit_end != dsml_limit_env && limit_value >= 256 && limit_value <= 32768)
+            dsml_unterminated_limit = (int)limit_value;
+    }
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
@@ -10896,6 +11140,34 @@ decode_again:
             }
         }
         if (token == ds4_token_eos(s->engine)) {
+            if (thinking_gates_tool_markers && thinking.inside &&
+                !eos_think_recovery_attempted)
+            {
+                eos_think_recovery_attempted = true;
+                int recovered = chat_force_close_thinking(s, &text, &thinking,
+                                                          &completion, max_tokens,
+                                                          err, sizeof(err));
+                if (recovered > 0) {
+                    tool_scan_waiting_for_think_close = true;
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s EOS inside unclosed <think>; forced close and continuing",
+                               ctx_span);
+                    trace_event(s, trace_id,
+                                "EOS inside unclosed thinking; forced close and continuing");
+                    continue;
+                }
+                if (recovered < 0) {
+                    finish = "error";
+                    break;
+                }
+                finish = "error";
+                snprintf(err, sizeof(err),
+                         "model stopped with unclosed thinking and no recovery budget");
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s EOS inside unclosed <think>; no recovery budget",
+                           ctx_span);
+                break;
+            }
             server_log(completion == 0 ? DS4_LOG_WARNING : DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s %s stop selected=%d bos=%d eos=%d completion=%d",
                        ctx_span, completion == 0 ? "first-token" : "eos",
@@ -11063,6 +11335,12 @@ decode_again:
                      * forgot to close its thinking; recover by forcing the
                      * close so the model restarts the call on the executable
                      * side. */
+                    const size_t recovery_scan_from = think_recovery_scan_from;
+                    const char *recovery_tool_start = text.ptr &&
+                        recovery_scan_from <= text.len ?
+                        find_any_tool_start(text.ptr + recovery_scan_from) : NULL;
+                    const size_t recovery_tool_offset = recovery_tool_start ?
+                        (size_t)(recovery_tool_start - text.ptr) : SIZE_MAX;
                     const int recovered = think_tool_recovery_enabled ?
                         chat_think_tool_recovery(s, &text, &thinking,
                                                  &think_recovery_scan_from,
@@ -11074,6 +11352,10 @@ decode_again:
                         break;
                     }
                     if (recovered) {
+                        if (recovery_tool_offset != SIZE_MAX) {
+                            forced_think_tool_start = recovery_tool_offset;
+                            forced_think_close_at = text.len - strlen("</think>\n\n");
+                        }
                         server_log(DS4_LOG_WARNING,
                                    "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
                                    "forced </think> after %d generated tokens",
@@ -11129,6 +11411,21 @@ decode_again:
                                     "progress gen=%d dsml_start=%d dsml_end=%d",
                                     completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
                         next_tool_progress += 128;
+                    }
+                    if (saw_tool_start && !saw_tool_end &&
+                        completion >= dsml_unterminated_limit) {
+                        finish = "error";
+                        snprintf(err, sizeof(err),
+                                 "unterminated tool call after %d tokens",
+                                 completion);
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: chat ctx=%s%s%s aborting unterminated DSML after %d tokens",
+                                   ctx_span, req_flags[0] ? " " : "", req_flags,
+                                   completion);
+                        trace_event(s, trace_id,
+                                    "aborted unterminated DSML after %d tokens",
+                                    completion);
+                        stop_decode = true;
                     }
                 }
             }
@@ -11282,10 +11579,17 @@ decode_again:
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
+        char *normalized_recovery = NULL;
+        const char *parse_text = text.ptr ? text.ptr : "";
+        if (forced_think_tool_start != SIZE_MAX && forced_think_close_at != SIZE_MAX) {
+            normalized_recovery = normalize_forced_think_tool_close(
+                parse_text, forced_think_tool_start, forced_think_close_at);
+            if (normalized_recovery) parse_text = normalized_recovery;
+        }
         bool parsed_ok = parse_generated_message_for_response(
-            text.ptr ? text.ptr : "",
+            parse_text,
             j->req.has_tools,
-            saw_tool_start,
+            saw_tool_start || normalized_recovery != NULL,
             ds4_think_mode_enabled(j->req.think_mode),
             &final_finish,
             err,
@@ -11294,6 +11598,16 @@ decode_again:
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure);
+        if (parsed_ok && normalized_recovery && parsed_calls.len > 0 &&
+            strcmp(final_finish, "error") != 0)
+        {
+            final_finish = "tool_calls";
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s recovered tool call completed across forced </think>",
+                       ctx_span);
+            trace_event(s, trace_id, "recovered tool call completed across forced </think>");
+        }
+        free(normalized_recovery);
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -11947,11 +12261,12 @@ static bool send_models(server *s, int fd) {
                 if (de->d_name[0] == '.') continue;                 /* ., .., hidden */
                 if (strchr(de->d_name, '/') || strchr(de->d_name, ':')) continue;
                 for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++) {
-                    char id[256];
-                    snprintf(id, sizeof(id), "%s:%s%s",
-                             base, de->d_name, k_steer_tiers[t].suffix);
+                    buf id = {0};
+                    buf_printf(&id, "%s:%s%s",
+                               base, de->d_name, k_steer_tiers[t].suffix);
                     buf_putc(&b, ',');
-                    append_model_json(&b, s, id);
+                    append_model_json(&b, s, id.ptr);
+                    buf_free(&id);
                 }
             }
             closedir(d);
@@ -12144,6 +12459,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool adaptive_thinking;
     const char *steering_dir;
 } server_config;
 
@@ -12346,6 +12662,8 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--adaptive-thinking")) {
+            c.adaptive_thinking = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -12453,6 +12771,11 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    if (cfg.adaptive_thinking && setenv("DS4_ADAPTIVE_THINKING", "1", 1) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to enable adaptive thinking: %s",
+                   strerror(errno));
+        return 1;
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
@@ -12507,6 +12830,10 @@ int main(int argc, char **argv) {
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
+    }
+    if (cfg.adaptive_thinking) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: adaptive thinking enabled; explicit client controls still take priority");
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
@@ -13778,21 +14105,60 @@ static void test_reasoning_effort_mapping(void) {
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    bool specified = false;
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &specified));
+    TEST_ASSERT(specified);
     TEST_ASSERT(!enabled);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    specified = false;
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &specified));
+    TEST_ASSERT(specified);
     TEST_ASSERT(enabled);
+    thinking = "null";
+    enabled = false;
+    specified = true;
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &specified));
+    TEST_ASSERT(!specified);
+    TEST_ASSERT(!enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
-    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
+    specified = false;
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, &specified));
+    TEST_ASSERT(specified);
     TEST_ASSERT(mode == DS4_THINK_MAX);
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_HIGH;
-    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
+    specified = false;
+    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode, &specified));
+    TEST_ASSERT(specified);
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+}
+
+static void test_adaptive_thinking_selection(void) {
+    char policy[96];
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Diagnose this compiler error, patch the code, and add regression tests.");
+    chat_msgs_push(&msgs, user);
+
+    TEST_ASSERT(select_think_mode(true, false, DS4_THINK_NONE, NULL, &msgs, NULL,
+                                  true, 131072, policy, sizeof(policy)) == DS4_THINK_NONE);
+    TEST_ASSERT(!strcmp(policy, "explicit-request"));
+
+    TEST_ASSERT(setenv("DS4_ADAPTIVE_THINKING", "1", 1) == 0);
+    TEST_ASSERT(select_think_mode(false, false, DS4_THINK_NONE, "deepseek-v4-flash",
+                                  &msgs, NULL, true, 131072,
+                                  policy, sizeof(policy)) == DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(policy, "adaptive-tools-or-complex"));
+    TEST_ASSERT(select_think_mode(false, false, DS4_THINK_NONE, "deepseek-chat",
+                                  &msgs, NULL, true, 131072,
+                                  policy, sizeof(policy)) == DS4_THINK_NONE);
+    TEST_ASSERT(!strcmp(policy, "model-alias-chat"));
+    TEST_ASSERT(unsetenv("DS4_ADAPTIVE_THINKING") == 0);
+    chat_msgs_free(&msgs);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -14361,6 +14727,37 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_forced_think_close_preserves_completed_tool_call(void) {
+    buf generated = {0};
+    buf_puts(&generated, "<think>need to inspect files\n");
+    size_t tool_start = generated.len;
+    buf_puts(&generated, DS4_TOOL_CALLS_START "\n"
+             DS4_INVOKE_START " name=\"read\">\n"
+             DS4_PARAM_START " name=\"path\" string=\"true\">src/main.c"
+             DS4_PARAM_END "\n");
+    size_t injected_at = generated.len;
+    buf_puts(&generated, "</think>\n\n");
+    buf_puts(&generated, DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END);
+
+    char *normalized = normalize_forced_think_tool_close(generated.ptr, tool_start,
+                                                           injected_at);
+    TEST_ASSERT(normalized != NULL);
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(normalized, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "read"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "src/main.c") != NULL);
+
+    free(normalized);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&generated);
 }
 
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
@@ -15536,7 +15933,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_free(&claude);
 }
 
-static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
+static void test_kv_cache_chat_anchor_uses_latest_multiturn_user(void) {
     const int user = 9001;
     const int assistant = 9002;
     kv_disk_cache kc = {0};
@@ -15548,14 +15945,14 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_push(&prompt, 2);
     ds4_tokens_push(&prompt, user);      /* first task */
     ds4_tokens_push(&prompt, 3);
-    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
+    ds4_tokens_push(&prompt, assistant);
     ds4_tokens_push(&prompt, 4);
-    ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
+    ds4_tokens_push(&prompt, user);      /* latest request starts here */
     ds4_tokens_push(&prompt, 5);
     ds4_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 6);
 
-    kc.opt.min_tokens = 3;
+    kc.opt.min_tokens = 7;
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
@@ -15585,6 +15982,18 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+}
+
+static void test_prefill_cancel_tracks_closed_stream_and_deadline(void) {
+    server_prefill_progress p = {0};
+    TEST_ASSERT(!server_prefill_cancel_cb(&p));
+
+    p.stream_failed = true;
+    TEST_ASSERT(server_prefill_cancel_cb(&p));
+
+    p.stream_failed = false;
+    p.deadline = now_sec() - 1.0;
+    TEST_ASSERT(server_prefill_cancel_cb(&p));
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -16521,6 +16930,7 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
+    test_adaptive_thinking_selection();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
@@ -16563,6 +16973,7 @@ static void ds4_server_unit_tests_run(void) {
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
+    test_forced_think_close_preserves_completed_tool_call();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
@@ -16601,8 +17012,9 @@ static void ds4_server_unit_tests_run(void) {
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
-    test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_chat_anchor_uses_latest_multiturn_user();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_prefill_cancel_tracks_closed_stream_and_deadline();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
